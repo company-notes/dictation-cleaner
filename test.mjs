@@ -3,18 +3,15 @@ import test from 'node:test';
 import gateway from './worker.js';
 
 const accountID = '0'.repeat(32);
-const gatewayKey = 'gateway-test-key-not-real';
 const cloudflareKey = 'cloudflare-test-token-not-real';
 const env = {
   CF_ACCOUNT_ID: accountID,
-  CF_API_TOKEN: cloudflareKey,
-  GATEWAY_API_KEY: gatewayKey,
   GROQ_API_KEY: 'groq-test-token-not-real',
 };
 const model = '@cf/qwen/qwen3-30b-a3b-fp8';
 const base = 'https://example.workers.dev';
 
-function makeRequest(path, body, token = gatewayKey) {
+function makeRequest(path, body, token = cloudflareKey) {
   return new Request(`${base}${path}`, {
     method: 'POST',
     headers: {
@@ -59,9 +56,12 @@ test('configuration is required, fail fast with no upstream access', async () =>
   assert.equal(invalid.status, 503);
 });
 
-test('gateway key is mandatory and separate from upstream token', async () => {
-  globalThis.fetch = () => {
-    throw new Error('Unauthenticated client reached upstream');
+test('client supplies Cloudflare token and missing or malformed Bearer is rejected', async () => {
+  let calls = 0;
+  globalThis.fetch = async (_url, options) => {
+    calls++;
+    assert.equal(options.headers.authorization, 'Bearer another-client-token');
+    return cloudflareReply();
   };
 
   const missing = await gateway.fetch(new Request(`${base}/v1/chat/completions`, {
@@ -71,11 +71,15 @@ test('gateway key is mandatory and separate from upstream token', async () => {
   }), env);
   assert.equal(missing.status, 401);
 
-  const wrong = await gateway.fetch(makeRequest('/v1/chat/completions', chatBody(), cloudflareKey), env);
-  assert.equal(wrong.status, 401);
+  const invalid = await gateway.fetch(makeRequest('/v1/chat/completions', chatBody(), ''), env);
+  assert.equal(invalid.status, 401);
+
+  const supplied = await gateway.fetch(makeRequest('/v1/chat/completions', chatBody(), 'another-client-token'), env);
+  assert.equal(supplied.status, 200);
+  assert.equal(calls, 1);
 });
 
-test('Cloudflare chat uses configured account and configured secret, not client key', async () => {
+test('Cloudflare chat uses configured Account ID and client Bearer token', async () => {
   let count = 0;
   globalThis.fetch = async (url, options) => {
     count++;
@@ -158,7 +162,7 @@ test('Cloudflare ASR receives the same configured upstream account and token', a
 
   const response = await gateway.fetch(new Request(`${base}/v1/audio/transcriptions`, {
     method: 'POST',
-    headers: { authorization: `Bearer ${gatewayKey}` },
+    headers: { authorization: `Bearer ${cloudflareKey}` },
     body: form,
   }), env);
   assert.equal(response.status, 200);
@@ -171,9 +175,8 @@ test('debug endpoint is absent, model listing and health are intact', async () =
 
   const health = await gateway.fetch(new Request(`${base}/health`), env);
   assert.equal(health.status, 200);
-  assert.equal((await health.json()).version, '2.6.0');
+  assert.equal((await health.json()).version, '2.7.0');
 
   const listing = await gateway.fetch(new Request(`${base}/v1/models`), env);
   assert.equal((await listing.json()).data[0].id, model);
 });
-
