@@ -1,94 +1,102 @@
 # Dictation Cleaner
 
-> Self-hosted, OpenAI-compatible speech-to-text cleanup gateway for **OpenWhispr**, **Handy**, and **OpenLess**, using Cloudflare Workers AI and optional Groq fallback.
+An OpenAI-compatible Cloudflare Worker for AI dictation cleanup, designed for **OpenWhispr**, **Handy**, and **OpenLess**. It uses **Cloudflare Workers AI** for text cleanup and can optionally switch to a **Groq** text model when Cloudflare's daily free inference quota is exhausted.
 
-Dictation Cleaner is a single-file Cloudflare Worker. It forwards dictation transcripts to Qwen3, normalizes chat-completion responses, handles Qwen3's empty final responses with a same-model retry, and optionally falls back to Groq when Cloudflare reports that the daily free quota is exhausted.
-
-**Set your Cloudflare Account ID as a Worker variable. Enter your Workers AI API token directly in OpenWhispr, just as in the original working setup. No Account ID or token is hard-coded in `worker.js`.**
+This is a single-file Worker. You can deploy it from the Cloudflare dashboard without installing a command-line tool.
 
 ## How it works
 
 ```text
 OpenWhispr / Handy / OpenLess
-  ├── Speech recognition: Groq Whisper (configured in the app, optional)
-  └── Text cleanup: OpenAI-compatible /v1/chat/completions
-          ↓ HTTPS + your Cloudflare Workers AI token (Bearer)
-     Your Cloudflare Worker
-          ↓ same Bearer token + CF_ACCOUNT_ID
-     Cloudflare Workers AI / Qwen3-30B-A3B-FP8
-          └── only on confirmed free-quota exhaustion (3036)
-              → Groq Qwen3.8-27B (requires GROQ_API_KEY)
+  ├─ Speech recognition: Groq Whisper (configured directly in the app)
+  └─ Text cleanup: OpenAI-compatible /v1/chat/completions
+               │  Your Cloudflare Workers AI token
+               ▼
+          Your Cloudflare Worker
+               │  CF_ACCOUNT_ID + the same Bearer token
+               ▼
+    Cloudflare Workers AI / Qwen3-30B-A3B-FP8
+               └─ Optional: on daily free quota exhaustion only
+                  → Groq Qwen3.8-27B (requires GROQ_API_KEY)
 ```
 
-Cloudflare Whisper ASR is also supported at `/v1/audio/transcriptions`, so you can use the gateway as an optional ASR adapter. When OpenWhispr uses Groq Whisper directly, **audio goes to Groq** and only the transcript is sent to this Worker for cleanup.
+You can also use the Worker's `/v1/audio/transcriptions` endpoint as a Cloudflare Whisper ASR adapter. When OpenWhispr uses Groq Whisper directly, audio goes to Groq and the transcript goes to this Worker for cleanup.
 
-## Quick start: Cloudflare Dashboard (no CLI required)
+## Deploy in Cloudflare
 
-1. Create a Cloudflare account and visit **Workers AI → Use REST API**. Copy your **Account ID** and create a Workers AI API token with **Account → Workers AI → Read** permission. Use the specific account you will configure below.
-2. In **Workers & Pages**, create a new Worker (for example, *Start with Hello World*), open **Edit Code**, replace the example with [`worker.js`](./worker.js), and **Deploy**.
-3. In your Worker, open **Settings → Variables and Secrets → Add**. Set **`CF_ACCOUNT_ID`** as a **Text** variable containing your own 32-character Account ID, then **Deploy**. **Do not enter your Cloudflare API token in Worker settings**; the client will supply it on each request.
+1. In your [Cloudflare dashboard](https://dash.cloudflare.com/), open **Workers AI → Use REST API**. Find your **Account ID** and create a **Workers AI API token** with access to that account.
+2. Open **Workers & Pages**, create a Worker (for example, **Start with Hello World**), choose **Edit Code**, and replace the example with [`worker.js`](./worker.js).
+3. Click **Deploy**.
+4. Open your Worker **Settings → Variables and Secrets → Add** and configure the variables below. Deploy the updated settings.
+5. Visit `https://YOUR-WORKER.YOUR-SUBDOMAIN.workers.dev/health`. A successful deployment returns JSON containing `"ok": true` and a version number.
 
-| Variable name | Cloudflare type | Required | Value |
-| --- | --- | --- | --- |
-| `CF_ACCOUNT_ID` | **Text** | Yes | Your Cloudflare Account ID (32 hexadecimal characters). |
-| `GROQ_API_KEY` | **Secret** | No | Your Groq API key, only for fallback when Cloudflare's daily free quota is exhausted. |
+**Required Worker variable**
 
-**Cloudflare token:** Obtain a Workers AI API token in your Cloudflare account and enter it in **OpenWhispr's API Key field**. The Worker forwards the client's `Authorization: Bearer ...` header to Cloudflare. There is no `CF_API_TOKEN` or `GATEWAY_API_KEY` variable. Keep the token private, and do not embed it in source code, a public README, or screenshots.
-
-4. Open `https://YOUR-WORKER.YOUR-SUBDOMAIN.workers.dev/health` in a browser. A correctly configured Worker returns JSON with `"ok":true` and `"version":"2.7.0"`. Missing or invalid required variables yield **503**, including which setting needs attention (never its value).
-5. Configure your dictation client using the Worker base URL plus `/v1`.
-
-### OpenWhispr (Windows)
-
-In **AI Models → Speech-to-text**, choose **Groq** (or Custom) and configure your speech-recognition provider. For example:
-
-```text
-Speech provider : Groq / Custom
-Base URL        : https://api.groq.com/openai/v1
-API key         : Your Groq API key
-ASR model       : whisper-large-v3 (or whisper-large-v3-turbo)
-```
-
-In **AI Models → Language Model → Dictation Cleanup**, enable cleanup and choose **Self Hosted / OpenAI-compatible**:
-
-```text
-Base URL        : https://YOUR-WORKER.YOUR-SUBDOMAIN.workers.dev/v1
-API Key         : Your Cloudflare Workers AI API token
-Model           : @cf/qwen/qwen3-30b-a3b-fp8
-Disable thinking: On (if available)
-```
-
-Use the model-refresh control if OpenWhispr asks you to select a model. The Worker exposes `/v1/models` for the model picker. Do **not** append `/chat/completions` to the base URL; OpenWhispr builds that path.
-
-**Handy and OpenLess** can use the same `/v1` base URL, Qwen3 model ID, and their own Cloudflare Workers AI API token for chat cleanup. This gateway accepts both non-streaming JSON and streaming SSE. For Cloudflare ASR via OpenLess, use its OpenAI-compatible speech recognition provider with model `whisper-1` and the same gateway key.
-
-### Upgrading from the earlier Gateway Key version
-
-This version **restores the original authentication behavior**. Keep the same Worker URL and Qwen3 model. Set `CF_ACCOUNT_ID` in Cloudflare Worker Variables; in your dictation app's API Key field, use **your Cloudflare Workers AI API token directly**, not the gateway key. The formerly required `CF_API_TOKEN` and `GATEWAY_API_KEY` Worker Secrets are no longer used and may be deleted from Worker settings. `GROQ_API_KEY` remains optional.
-
-## API endpoints
-
-| Method / path | Purpose | Authorization |
+| Name | Type | Value |
 | --- | --- | --- |
-| `GET /health` | Health/version; **503** if Account ID missing | Public (no secret values returned) |
-| `GET /v1/models` | OpenAI-compatible Qwen3 model listing | Public (non-sensitive metadata) |
-| `POST /v1/chat/completions` | JSON or SSE chat cleanup | `Authorization: Bearer <Cloudflare Workers AI API token>` |
-| `POST /v1/audio/transcriptions` | Optional Whisper audio transcription adapter | `Authorization: Bearer <Cloudflare Workers AI API token>` |
+| `CF_ACCOUNT_ID` | Text | Your Cloudflare Account ID (32 hexadecimal characters) |
 
-Without the `/v1` prefix, the model/chat/audio routes are also accepted for compatibility. The previous `/debug/qwen` endpoint has been **removed** (404).
+**Optional Worker secret**
 
-## Models and fallback behavior
+| Name | Type | Value |
+| --- | --- | --- |
+| `GROQ_API_KEY` | Secret | Your Groq API key, used only for the optional text-cleanup fallback |
 
-- **Primary:** Cloudflare `@cf/qwen/qwen3-30b-a3b-fp8`, with `/no_think` control; if Cloudflare returns 200 but no usable final content, the Worker retries **the same model** once without that control for non-streaming requests.
-- **Optional fallback:** Groq `qwen/qwen3.8-27b` only when a Cloudflare HTTP **429** clearly means daily free-neuron quota exhausted (**Cloudflare error code 3036** or matching quota wording). This is a **different Qwen model**, not the same model hosted elsewhere.
-- **No fallback** for authorization errors, malformed requests, generic 429, or Cloudflare error **3040** (capacity issues). If `GROQ_API_KEY` is missing, the gateway returns an explicit quota error instead of silently using another provider.
-- **ASR:** Cloudflare `@cf/openai/whisper-large-v3-turbo` is available through this Worker's optional ASR endpoint; external Groq Whisper ASR is configured directly in OpenWhispr and is unrelated to the text-cleanup fallback.
+**Where to put the Cloudflare API token:** Enter it in your dictation application's **API Key** field. The Worker forwards `Authorization: Bearer <your Cloudflare Workers AI token>` to Cloudflare. There is no server-side Cloudflare token binding to configure. Never put a real token in `worker.js`, GitHub, a README, or screenshots.
 
-Provider free limits, availability, and model names can change. Neither service guarantees unlimited free processing; if a provider bills your account, charges may apply. The Worker never silently changes to Groq unless the documented quota condition is detected and its key has been configured.
+### Optional model, limit, and language settings
 
-## Custom cleanup prompt
+All settings below can be added under **Settings → Variables and Secrets** as **Text** variables. Omit a variable to keep the default. The values shown here are the defaults and are applied without any configuration.
 
-Configure your cleanup instructions in OpenWhispr's **Prompt Studio**. An example for Traditional Chinese:
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CHAT_MODEL` | `@cf/qwen/qwen3-30b-a3b-fp8` | Cloudflare text-cleanup model and model ID exposed to clients |
+| `GROQ_CHAT_MODEL` | `qwen/qwen3.8-27b` | Groq text fallback model |
+| `GROQ_CHAT_URL` | `https://api.groq.com/openai/v1/chat/completions` | HTTPS Groq chat-completions endpoint |
+| `ASR_MODEL` | `@cf/openai/whisper-large-v3-turbo` | Cloudflare audio transcription model |
+| `ASR_ALIASES` | `whisper-1,whisper-large-v3-turbo,<ASR_MODEL>` | Comma-separated model names accepted by the ASR adapter; `<ASR_MODEL>` is replaced with the actual `ASR_MODEL` value |
+| `MAX_CHAT_BYTES` | `65536` | Maximum JSON chat request size (bytes) |
+| `MAX_AUDIO_BYTES` | `5242880` | Maximum uploaded audio file size (bytes) |
+| `MAX_MULTIPART_BYTES` | `MAX_AUDIO_BYTES + 65536` | Maximum multipart request size (bytes), including form overhead |
+| `DEFAULT_ASR_LANGUAGE` | `zh` | Default Whisper language; set to an empty string for automatic detection |
+| `ASR_VOCAB_HINT` | `model, Qwen3, Qwen3-30B-A3B, Cloudflare, Workers AI, Handy, API, LLM, ASR, reasoning_effort, prompt, token, OpenRouter, Ollama` | Comma-separated context vocabulary provided as a Whisper prompt; set to an empty string to disable |
+
+If you change `MAX_AUDIO_BYTES` but omit `MAX_MULTIPART_BYTES`, the multipart limit automatically follows your audio limit plus 65,536 bytes. Explicit multipart limits must be at least the audio limit. Numeric limits must be positive integers. Invalid settings return a configuration error (503) instead of silently reverting to a default.
+
+`ASR_ALIASES` is a list of accepted incoming names, not the Cloudflare model ID itself. For example, `whisper-1,my-whisper` permits those two identifiers. Changing the actual ASR model does not require changing the client model name if you keep an alias.
+
+## Configure OpenWhispr (Windows)
+
+### 1. Speech recognition
+
+In **Settings → AI Models → Speech-to-text → Dictation**, choose a cloud provider such as **Groq**, or configure a custom OpenAI-compatible provider:
+
+```text
+Endpoint URL : https://api.groq.com/openai/v1
+API Key      : your Groq API key
+Model        : whisper-large-v3
+```
+
+You can try `whisper-large-v3-turbo` if you want faster transcription. Your Groq transcription settings are independent of the Worker's optional `GROQ_API_KEY` fallback secret.
+
+### 2. AI dictation cleanup
+
+In **Settings → AI Models → Language Model → Dictation Cleanup**, enable text cleanup, select **Self Hosted / OpenAI-compatible**, and configure:
+
+```text
+Endpoint URL    : https://YOUR-WORKER.YOUR-SUBDOMAIN.workers.dev/v1
+API Key         : your Cloudflare Workers AI API token
+Model           : @cf/qwen/qwen3-30b-a3b-fp8
+Disable thinking: on (if offered)
+```
+
+If you change the `CHAT_MODEL` Worker variable, enter that same model ID in OpenWhispr. Refresh the model list if needed. Specify the base URL ending in `/v1` — **do not** append `/chat/completions`.
+
+Handy and OpenLess can use the same `/v1` URL, model ID, and their own Cloudflare Workers AI tokens. Chat cleanup accepts JSON responses and streaming SSE; the optional Cloudflare ASR adapter accepts model `whisper-1` by default.
+
+### 3. Cleanup prompt (optional)
+
+OpenWhispr's **Prompt Studio** can customize text cleanup. For example:
 
 ```text
 請以台灣繁體中文整理語音逐字稿，保留原本意思和語氣。
@@ -98,29 +106,43 @@ Configure your cleanup instructions in OpenWhispr's **Prompt Studio**. An exampl
 只輸出整理後的文字，不要補充解釋。
 ```
 
-The client controls the prompt; this project is an API adapter, not a replacement for speech recognition or OpenWhispr's prompt settings.
+## API endpoints
+
+| Method / path | Purpose | Authorization |
+| --- | --- | --- |
+| `GET /health` | Service status, model IDs and version | None; does not expose tokens |
+| `GET /v1/models` | OpenAI-compatible chat model list | None; model metadata only |
+| `POST /v1/chat/completions` | Text cleanup (JSON or SSE) | Your Cloudflare Workers AI Bearer token |
+| `POST /v1/audio/transcriptions` | Optional Cloudflare Whisper adapter | Your Cloudflare Workers AI Bearer token |
+
+The model, chat and audio paths also accept requests without the `/v1` prefix for compatibility.
+
+## Groq fallback
+
+- **Primary:** the configured Cloudflare `CHAT_MODEL`. For non-streaming requests, the Worker retries the same model once if Cloudflare produces no usable final text.
+- **Fallback:** the configured Groq `GROQ_CHAT_MODEL` only on HTTP **429** indicating the Cloudflare daily free quota has been exhausted (error **3036** or the equivalent quota message), and only when `GROQ_API_KEY` is configured.
+- **No automatic fallback:** HTTP 400/401/403, generic 429, capacity error **3040**, or unrelated upstream failures. An unconfigured fallback returns a clear quota error.
+
+Cloudflare and Groq offer different models and have separate quotas, pricing and privacy terms. A fallback request forwards the text and cleanup instructions to Groq; it does not send the original audio recording. Model availability and free limits can change.
 
 ## Privacy and security
 
-- **Not a local-only solution:** Cloud speech recognition can send audio to Groq; cleanup sends text to Cloudflare Workers AI. Optional fallback sends the cleanup request to Groq.
-- **Configuration:** `CF_ACCOUNT_ID` is a non-secret Worker Text variable. OpenWhispr supplies the Cloudflare Workers AI API token per request. Optional `GROQ_API_KEY` belongs in Cloudflare **Secrets**. Do not commit real IDs or keys.
-- **Authentication:** Chat and optional ASR endpoints require an `Authorization: Bearer <Cloudflare Workers AI API token>` header. The Worker forwards the token to Cloudflare without storing it; Cloudflare validates it. Do not share your Cloudflare token with untrusted users.
-- **Rotation:** Previously shared or accidentally published credentials should be revoked and replaced, including any pasted into chat or screenshots.
-- **Logs:** The Worker only logs response status/shape and count metadata for troubleshooting, not transcript text, model responses, request headers, or keys. Platform request logs may contain network metadata.
-- **Local files:** Never commit `.env`, `.dev.vars`, Cloudflare API tokens, or screenshots showing live keys.
+- This is **not** a fully local speech recognition pipeline. Groq Whisper may receive audio, and Cloudflare Workers AI receives transcribed text.
+- A request with a Cloudflare API token is sent over HTTPS to your Worker. The Worker forwards the same token to Cloudflare, which validates it. Anyone with a valid token for your configured account could consume that account's inference quota; do not share tokens publicly.
+- The optional Groq fallback uses `GROQ_API_KEY` stored as a Worker **Secret**. Keep it out of source control.
+- The Worker logs limited response-status/shape metadata for troubleshooting, not transcript text, request headers, API tokens or full model outputs. Cloudflare's platform logs may still contain network metadata.
+- Revoke any API token that has been posted in a public forum, repository or shared screenshot.
 
-## Run the tests
+## Tests
 
-Requires Node.js 22+ (built-in `fetch`, `FormData`, and test runner):
+Node.js 22+ is recommended. The test suite uses mocked upstream responses and does not access a real Cloudflare or Groq account.
 
 ```bash
 node --check worker.js
 node --test test.mjs
 ```
 
-Tests mock all HTTP calls and **do not access real Cloudflare/Groq APIs**. They cover the required Account ID, client-provided Bearer token, correct account URL, quota fallback, error handling, SSE, optional ASR, and the removed debug endpoint.
-
-## Docs
+## References
 
 - [Cloudflare Workers AI REST API](https://developers.cloudflare.com/workers-ai/get-started/rest-api/)
 - [Cloudflare Worker variables](https://developers.cloudflare.com/workers/configuration/environment-variables/)
