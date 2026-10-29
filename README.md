@@ -129,4 +129,3 @@ Tests mock all HTTP calls and **do not access real Cloudflare/Groq APIs**. They 
 - [Cloudflare Worker secrets](https://developers.cloudflare.com/workers/configuration/secrets/)
 - [Groq API](https://console.groq.com/docs/overview)
 - [OpenWhispr](https://github.com/OpenWhispr/openwhispr)
-
