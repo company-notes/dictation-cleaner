@@ -1,27 +1,106 @@
 /**
- * Cloudflare Workers AI compatibility gateway for Handy, OpenLess and OpenWhispr (v2.7).
+ * Cloudflare Workers AI compatibility gateway for Handy, OpenLess and OpenWhispr.
  *
  * Paste entire source into an existing Cloudflare Worker and click Deploy.
  * The client supplies its own Cloudflare Workers AI token as a Bearer header.
  * Cloudflare Workers AI is primary; Groq is used only when Cloudflare reports quota exhaustion.
  */
 
-const CHAT_MODEL = "@cf/qwen/qwen3-30b-a3b-fp8";
-const GROQ_CHAT_MODEL = "qwen/qwen3.8-27b";
-const GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions";
-const ASR_MODEL = "@cf/openai/whisper-large-v3-turbo";
-const ASR_ALIASES = new Set(["whisper-1", "whisper-large-v3-turbo", ASR_MODEL]);
-const MAX_CHAT_BYTES = 64 * 1024;
-const MAX_AUDIO_BYTES = 5 * 1024 * 1024; // WAV 16 kHz 16-bit mono ≈ 2.7 minutes; not a guarantee of model support
-const MAX_MULTIPART_BYTES = MAX_AUDIO_BYTES + 64 * 1024;
+const DEFAULTS = Object.freeze({
+  chatModel: "@cf/qwen/qwen3-30b-a3b-fp8",
+  groqChatModel: "qwen/qwen3.8-27b",
+  groqChatUrl: "https://api.groq.com/openai/v1/chat/completions",
+  asrModel: "@cf/openai/whisper-large-v3-turbo",
+  asrAliases: ["whisper-1", "whisper-large-v3-turbo"],
+  maxChatBytes: 64 * 1024,
+  maxAudioBytes: 5 * 1024 * 1024,
+  multipartOverheadBytes: 64 * 1024,
+  defaultAsrLanguage: "zh",
+  asrVocabHint: "model, Qwen3, Qwen3-30B-A3B, Cloudflare, Workers AI, Handy, API, LLM, ASR, reasoning_effort, prompt, token, OpenRouter, Ollama",
+});
 
-// Leave empty for auto-language detection. For Chinese-first conversations,
-// zh may improve stability, but can be less ideal for fully English speech.
-const DEFAULT_ASR_LANGUAGE = "zh";
+function optionalText(env, key, defaultValue) {
+  const value = env[key];
+  if (value === undefined) {
+    return defaultValue;
+  }
 
-// Context hint only; these are NOT guaranteed corrections. Client's OpenLess
-// dictionary prompt takes precedence. Set to "" to disable extra hints.
-const ASR_VOCAB_HINT = "model, Qwen3, Qwen3-30B-A3B, Cloudflare, Workers AI, Handy, API, LLM, ASR, reasoning_effort, prompt, token, OpenRouter, Ollama";
+  if (typeof value !== "string") {
+    throw new Error(`${key} must be a text variable`);
+  }
+
+  return value;
+}
+
+function nonEmptyText(env, key, defaultValue) {
+  const value = optionalText(env, key, defaultValue).trim();
+  if (!value) {
+    throw new Error(`${key} must not be empty`);
+  }
+
+  return value;
+}
+
+function positiveInteger(env, key, defaultValue) {
+  const text = optionalText(env, key, String(defaultValue)).trim();
+  if (!/^[1-9]\d*$/.test(text)) {
+    throw new Error(`${key} must be a positive integer (bytes)`);
+  }
+
+  const number = Number(text);
+  if (!Number.isSafeInteger(number)) {
+    throw new Error(`${key} must be a safe integer (bytes)`);
+  }
+
+  return number;
+}
+
+function getSettings(env) {
+  const chatModel = nonEmptyText(env, "CHAT_MODEL", DEFAULTS.chatModel);
+  const groqChatModel = nonEmptyText(env, "GROQ_CHAT_MODEL", DEFAULTS.groqChatModel);
+  const groqChatUrl = nonEmptyText(env, "GROQ_CHAT_URL", DEFAULTS.groqChatUrl);
+  const asrModel = nonEmptyText(env, "ASR_MODEL", DEFAULTS.asrModel);
+
+  const maxChatBytes = positiveInteger(env, "MAX_CHAT_BYTES", DEFAULTS.maxChatBytes);
+  const maxAudioBytes = positiveInteger(env, "MAX_AUDIO_BYTES", DEFAULTS.maxAudioBytes);
+  const maxMultipartBytes = positiveInteger(
+    env,
+    "MAX_MULTIPART_BYTES",
+    maxAudioBytes + DEFAULTS.multipartOverheadBytes,
+  );
+
+  // Unset values use the defaults. Explicitly empty language/hint disables them.
+  const defaultAsrLanguage = optionalText(env, "DEFAULT_ASR_LANGUAGE", DEFAULTS.defaultAsrLanguage).trim();
+  const asrVocabHint = optionalText(env, "ASR_VOCAB_HINT", DEFAULTS.asrVocabHint);
+  const defaultAliases = [...DEFAULTS.asrAliases, asrModel].join(",");
+  const aliasList = nonEmptyText(env, "ASR_ALIASES", defaultAliases);
+  const asrAliases = new Set(aliasList.split(",").map(alias => alias.trim()).filter(Boolean));
+
+  if (maxMultipartBytes < maxAudioBytes) {
+    throw new Error("MAX_MULTIPART_BYTES must be at least MAX_AUDIO_BYTES");
+  }
+
+  if (!/^https:\/\/[^\s]+$/i.test(groqChatUrl)) {
+    throw new Error("GROQ_CHAT_URL must be an HTTPS URL");
+  }
+
+  if (!asrAliases.size) {
+    throw new Error("ASR_ALIASES must contain at least one model name");
+  }
+
+  return {
+    chatModel,
+    groqChatModel,
+    groqChatUrl,
+    asrModel,
+    asrAliases,
+    maxChatBytes,
+    maxAudioBytes,
+    maxMultipartBytes,
+    defaultAsrLanguage,
+    asrVocabHint,
+  };
+}
 
 function getCloudflareAIRoot(accountID) {
   return `https://api.cloudflare.com/client/v4/accounts/${accountID}/ai`;
@@ -70,16 +149,18 @@ function toBase64(bytes) {
     for (let j = 0; j < chunk.length; j++) {
       binary += String.fromCharCode(chunk[j]);
     }
+
     encoded += btoa(binary);
   }
+
   return encoded;
 }
 
-function contextPrompt(clientPrompt) {
+function contextPrompt(clientPrompt, settings) {
   const local = typeof clientPrompt === "string" ? clientPrompt.trim() : "";
-  // OpenLess caps its own Whisper prompt to 240 chars. Keep same conservative
-  // budget while prioritizing user's explicit dictionary context.
-  return [local, ASR_VOCAB_HINT].filter(Boolean).join(", ").slice(0, 240);
+
+  // Prioritize a supplied dictionary hint within the Whisper prompt budget.
+  return [local, settings.asrVocabHint].filter(Boolean).join(", ").slice(0, 240);
 }
 
 // Never log request prompts, transcripts, responses, tokens, or request headers.
@@ -90,6 +171,7 @@ function recordChatDiagnostics(source, status, data, content, finishReason) {
   const firstChoice = Array.isArray(core.choices) ? core.choices[0] : null;
   const message = firstChoice?.message || {};
   const reasoning = message.reasoning_content ?? message.reasoning ?? "";
+
   console.info("[cf-chat]", JSON.stringify({
     source,
     upstream_status: status,
@@ -109,9 +191,11 @@ function textOf(content) {
   if (typeof content === "string") {
     return content;
   }
+
   if (Array.isArray(content)) {
     return content.map(part => typeof part?.text === "string" ? part.text : "").join("");
   }
+
   return "";
 }
 
@@ -128,6 +212,7 @@ function stripLeadingThinking(content) {
     }
     text = text.slice(end).replace(/^<\/think>/i, "").trim();
   }
+
   return text;
 }
 
@@ -136,9 +221,11 @@ function unpackChatResponse(data, model) {
       (Array.isArray(data.errors) && data.errors.length)) {
     return null;
   }
+
   const core = data.result && typeof data.result === "object" ? data.result : data;
   let content = "";
   let finishReason = "stop";
+
   if (Array.isArray(core.choices) && core.choices.length) {
     const choice = core.choices[0];
     content = textOf(choice?.message?.content || choice?.delta?.content);
@@ -148,13 +235,15 @@ function unpackChatResponse(data, model) {
     // Some intermediary gateways wrap standard Chat Completions in {result:{choices:...}}.
     content = textOf(core.response || core.output_text || core.text);
   }
+
   content = stripLeadingThinking(content);
+
   return {
     content, finishReason,
     response: {
       id: typeof core.id === "string" ? core.id : "chatcmpl-cloudflare-worker",
       object: "chat.completion",
-      created: typeof core.created === "number" ? core.created : Math.floor(Date.now()/1000),
+      created: typeof core.created === "number" ? core.created : Math.floor(Date.now() / 1000),
       model,
       choices: [{
         index: 0,
@@ -177,6 +266,7 @@ async function readChatJson(response, source, model) {
     }));
     return null;
   }
+
   const unpacked = unpackChatResponse(data, model);
   recordChatDiagnostics(source, response.status, data, unpacked?.content || "", unpacked?.finishReason);
   return unpacked;
@@ -190,6 +280,7 @@ async function isCloudflareQuotaExhausted(response) {
   if (response.status !== 429) {
     return false;
   }
+
   let payload;
   try {
     payload = await response.clone().json();
@@ -198,6 +289,7 @@ async function isCloudflareQuotaExhausted(response) {
     console.warn("[cf-chat] quota_response_not_json", error?.name || "Error");
     return false;
   }
+
   const codes = [
     payload?.code, payload?.error?.code,
     ...(Array.isArray(payload?.errors) ? payload.errors.map(e => e?.code) : []),
@@ -206,18 +298,20 @@ async function isCloudflareQuotaExhausted(response) {
   if (codes.some(code => Number(code) === 3036)) {
     return true;
   }
+
   const messages = [
     payload?.message, payload?.error?.message,
     ...(Array.isArray(payload?.errors) ? payload.errors.map(e => e?.message) : []),
-  ].filter(s => typeof s === "string");
+  ].filter(message => typeof message === "string");
+
   return messages.some(message => /(?:daily free allocation|used up your daily|free allocation of .{0,30}neurons|daily quota exceeded)/i.test(message));
 }
 
-function groqRequestBody(originalMessages, cloudflareBody, wantsStream) {
+function groqRequestBody(originalMessages, cloudflareBody, wantsStream, settings) {
   // Do not reuse Cloudflare-specific model name or /no_think message modification.
   // Groq's current Qwen 3.8 supports disabling reasoning with reasoning_effort:none.
   return {
-    model: GROQ_CHAT_MODEL,
+    model: settings.groqChatModel,
     messages: originalMessages,
     stream: wantsStream,
     temperature: 0.7,
@@ -227,78 +321,88 @@ function groqRequestBody(originalMessages, cloudflareBody, wantsStream) {
   };
 }
 
-async function runGroqFallback(env, originalMessages, cfBody, wantsStream) {
+async function runGroqFallback(env, originalMessages, cfBody, wantsStream, settings) {
   if (!env?.GROQ_API_KEY || typeof env.GROQ_API_KEY !== "string") {
     console.warn("[llm-route] cloudflare_quota_exhausted groq_secret_missing");
     return apiError("Cloudflare daily quota reached; set GROQ_API_KEY Worker secret to enable Groq fallback", 429, "quota_exceeded");
   }
+
   console.info("[llm-route] cloudflare_daily_quota_exhausted falling_back_to_groq");
   try {
-    const fallback = await fetch(GROQ_CHAT_URL, {
+    const fallback = await fetch(settings.groqChatUrl, {
       method: "POST",
       headers: {
         authorization: `Bearer ${env.GROQ_API_KEY}`,
         "content-type": "application/json",
         accept: wantsStream ? "text/event-stream" : "application/json",
       },
-      body: JSON.stringify(groqRequestBody(originalMessages, cfBody, wantsStream)),
+      body: JSON.stringify(groqRequestBody(originalMessages, cfBody, wantsStream, settings)),
       redirect: "manual",
     });
+
     if (!fallback.ok) {
       console.warn("[llm-route] groq_http_failure", JSON.stringify({ status: fallback.status }));
       return apiError(`Groq fallback returned HTTP ${fallback.status}`, fallback.status, "upstream_error");
     }
+
     const headers = {
       "cache-control": "no-store",
       "x-content-type-options": "nosniff",
       "x-llm-provider": "groq-fallback",
     };
+
     if (wantsStream) {
       const ct = fallback.headers.get("content-type") || "";
       if (!ct.toLowerCase().includes("text/event-stream")) {
-        const parsed = await readChatJson(fallback, "groq_fallback_unexpected_json", GROQ_CHAT_MODEL);
+        const parsed = await readChatJson(fallback, "groq_fallback_unexpected_json", settings.groqChatModel);
         if (!parsed?.content) {
           return apiError("Groq fallback returned no text", 502, "upstream_error");
         }
+
         const chunk = JSON.stringify({
           id: parsed.response.id, object: "chat.completion.chunk",
-          created: parsed.response.created, model: GROQ_CHAT_MODEL,
-          choices: [{index:0, delta:{role:"assistant",content:parsed.content}, finish_reason:null}],
+          created: parsed.response.created, model: settings.groqChatModel,
+          choices: [{ index: 0, delta: { role: "assistant", content: parsed.content }, finish_reason: null }],
         });
         return new Response(`data: ${chunk}\n\ndata: [DONE]\n\n`, {
           status: 200,
-          headers: {...headers, "content-type":"text/event-stream; charset=utf-8"},
+          headers: { ...headers, "content-type": "text/event-stream; charset=utf-8" },
         });
       }
+
       return new Response(fallback.body, {
         status: 200,
-        headers: {...headers, "content-type":"text/event-stream; charset=utf-8"},
+        headers: { ...headers, "content-type": "text/event-stream; charset=utf-8" },
       });
     }
-    const parsed = await readChatJson(fallback, "groq_fallback", GROQ_CHAT_MODEL);
+
+    const parsed = await readChatJson(fallback, "groq_fallback", settings.groqChatModel);
     if (!parsed?.content) {
       return apiError("Groq fallback returned no text", 502, "upstream_error");
     }
+
     return new Response(JSON.stringify(parsed.response), {
-      status: 200, headers: {...headers, "content-type":"application/json; charset=utf-8"},
+      status: 200,
+      headers: { ...headers, "content-type": "application/json; charset=utf-8" },
     });
   } catch (error) {
-    console.warn("[llm-route] groq_fetch_failed", JSON.stringify({name:error?.name || "Error"}));
+    console.warn("[llm-route] groq_fetch_failed", JSON.stringify({ name: error?.name || "Error" }));
     return apiError("Groq fallback network request failed", 502, "upstream_error");
   }
 }
 
-async function handleChat(request, cloudflareToken, env, cloudflareAIRoot) {
-  if (limitByHeader(request, MAX_CHAT_BYTES)) {
+async function handleChat(request, cloudflareToken, env, cloudflareAIRoot, settings) {
+  if (limitByHeader(request, settings.maxChatBytes)) {
     return apiError("Chat request too large", 413);
   }
 
   let body;
   try {
     const raw = await request.text();
-    if (new TextEncoder().encode(raw).length > MAX_CHAT_BYTES) {
+    if (new TextEncoder().encode(raw).length > settings.maxChatBytes) {
       return apiError("Chat request too large", 413);
     }
+
     body = JSON.parse(raw);
   } catch {
     return apiError("Invalid JSON", 400);
@@ -307,20 +411,14 @@ async function handleChat(request, cloudflareToken, env, cloudflareAIRoot) {
   if (!body || typeof body !== "object" || Array.isArray(body) || !Array.isArray(body.messages)) {
     return apiError("messages must be an array", 400);
   }
-  if (body.model !== CHAT_MODEL) {
-    return apiError(`Only ${CHAT_MODEL} is supported for chat`, 400);
 
-  // Verified fix: Cloudflare Qwen3 may produce reasoning_content only when
+  if (body.model !== settings.chatModel) {
+    return apiError(`Only ${settings.chatModel} is supported for chat`, 400);
   }
-  // Handy sends top-level reasoning_effort:none.
-  delete body.reasoning_effort;
-  // A number of OpenAI-compatible clients attach a Responses-style reasoning
-  // object. This Workers AI Qwen3 model uses neither that nor reasoning_effort.
-  delete body.reasoning;
 
-  // The model is ALWAYS the same Cloudflare Qwen3-30B-A3B-FP8.
-  // Cloudflare's Qwen3 model schema does not document chat_template_kwargs;
-  // that v2.3 override correlated with empty content and is deliberately removed.
+  // Keep Chat Completions inputs compatible with the Cloudflare model.
+  delete body.reasoning_effort;
+  delete body.reasoning;
   delete body.chat_template_kwargs;
   delete body.enable_thinking;
   delete body.reasoning_budget;
@@ -329,32 +427,39 @@ async function handleChat(request, cloudflareToken, env, cloudflareAIRoot) {
   if (!Number.isFinite(body.temperature) || body.temperature < 0.5) {
     body.temperature = 0.7;
   }
+
   if (!Number.isFinite(body.top_p) || body.top_p <= 0) {
     body.top_p = 0.8;
   }
+
   if (!Number.isInteger(body.max_tokens) || body.max_tokens < 1024) {
     body.max_tokens = 1024;
   }
   body.max_tokens = Math.min(body.max_tokens, 4096);
 
   const originalMessages = structuredClone(body.messages);
-  // Test this supported Qwen3 soft switch in isolation (no hard switch).
+
+  // Ask Qwen3 to return a final answer without exposing reasoning text.
   function buildMessages(softSwitch) {
     const messages = structuredClone(originalMessages);
     if (!softSwitch) {
       return messages;
     }
+
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i];
       if (msg?.role === "user" && typeof msg.content === "string") {
         if (!/\/no_think\s*$/i.test(msg.content)) {
           msg.content += "\n/no_think";
         }
+
         break;
       }
     }
+
     return messages;
   }
+
   body.messages = buildMessages(true);
 
   // Handy normally sends non-streaming requests, while OpenLess needs SSE.
@@ -373,8 +478,9 @@ async function handleChat(request, cloudflareToken, env, cloudflareAIRoot) {
       body: JSON.stringify(body),
       redirect: "manual",
     });
+
     if (await isCloudflareQuotaExhausted(upstream)) {
-      return runGroqFallback(env, originalMessages, body, wantsStream);
+      return runGroqFallback(env, originalMessages, body, wantsStream, settings);
     }
 
     if (!upstream.ok) {
@@ -394,12 +500,15 @@ async function handleChat(request, cloudflareToken, env, cloudflareAIRoot) {
             created: unpacked.response.created, model: body.model,
             choices: [{ index: 0, delta: { role: "assistant", content: unpacked.content }, finish_reason: null }],
           });
+
           return new Response(`data: ${chunk}\n\ndata: [DONE]\n\n`, {
             headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-store" },
           });
         }
+
         return apiError("Cloudflare stream returned no usable content; inspect [cf-chat] Worker log", 502, "upstream_error");
       }
+
       return new Response(upstream.body, {
         status: upstream.status,
         headers: {
@@ -414,9 +523,9 @@ async function handleChat(request, cloudflareToken, env, cloudflareAIRoot) {
     if (parsed?.content) {
       return responseJson(parsed.response);
 
-    // One controlled second attempt with *exactly the same model*, without
     }
-    // either thinking switch. It differs from v2.3's repeat of broken settings.
+
+    // Retry the same model with the original user message if cleanup returned no text.
     console.warn("[cf-chat] empty_final_retry_baseline_same_model");
     const baselineBody = { ...body, messages: buildMessages(false) };
     const fallback = await fetch(`${cloudflareAIRoot}/v1/chat/completions`, {
@@ -425,11 +534,13 @@ async function handleChat(request, cloudflareToken, env, cloudflareAIRoot) {
       body: JSON.stringify(baselineBody),
       redirect: "manual",
     });
+
     if (await isCloudflareQuotaExhausted(fallback)) {
-      return runGroqFallback(env, originalMessages, body, false);
+      return runGroqFallback(env, originalMessages, body, false, settings);
     }
+
     if (!fallback.ok) {
-      console.warn("[cf-chat] baseline_http_failure", JSON.stringify({status:fallback.status}));
+      console.warn("[cf-chat] baseline_http_failure", JSON.stringify({ status: fallback.status }));
       return apiError(`Cloudflare baseline retry returned HTTP ${fallback.status}`, 502, "upstream_error");
     }
 
@@ -437,6 +548,7 @@ async function handleChat(request, cloudflareToken, env, cloudflareAIRoot) {
     if (retryResult?.content) {
       return responseJson(retryResult.response);
     }
+
     return apiError("Cloudflare Qwen3 gave no final text on soft-only or baseline request; inspect [cf-chat] logs", 502, "upstream_error");
   } catch (error) {
     console.warn("[cf-chat] fetch_or_parse_failed", JSON.stringify({name: error?.name || "Error"}));
@@ -444,9 +556,9 @@ async function handleChat(request, cloudflareToken, env, cloudflareAIRoot) {
   }
 }
 
-async function handleTranscription(request, cloudflareToken, cloudflareAIRoot) {
-  if (limitByHeader(request, MAX_MULTIPART_BYTES)) {
-    return apiError("Audio upload too large (max 5 MiB audio)", 413);
+async function handleTranscription(request, cloudflareToken, cloudflareAIRoot, settings) {
+  if (limitByHeader(request, settings.maxMultipartBytes)) {
+    return apiError(`Audio upload too large (max ${settings.maxAudioBytes} bytes of audio)`, 413);
   }
 
   const contentType = request.headers.get("content-type") || "";
@@ -465,46 +577,49 @@ async function handleTranscription(request, cloudflareToken, cloudflareAIRoot) {
   if (!(file instanceof Blob) || file.size <= 0) {
     return apiError("Missing nonempty audio file field", 400);
   }
-  if (file.size > MAX_AUDIO_BYTES) {
-    return apiError("Audio file too large (max 5 MiB)", 413);
+  if (file.size > settings.maxAudioBytes) {
+    return apiError(`Audio file too large (max ${settings.maxAudioBytes} bytes)`, 413);
   }
 
   const model = form.get("model");
-  if (typeof model !== "string" || !ASR_ALIASES.has(model.trim())) {
-    return apiError("ASR model must be whisper-1, whisper-large-v3-turbo or @cf/openai/whisper-large-v3-turbo", 400);
+  if (typeof model !== "string" || !settings.asrAliases.has(model.trim())) {
+    return apiError(`ASR model must be one of: ${[...settings.asrAliases].join(", ")}`, 400);
   }
 
   const responseFormat = form.get("response_format");
   if (responseFormat !== null && !["json", "verbose_json", "text"].includes(String(responseFormat))) {
     return apiError("Supported response_format: json, verbose_json, text", 400);
   }
+
   const languageField = form.get("language");
   if (languageField !== null && (typeof languageField !== "string" || !/^[A-Za-z-]{2,12}$/.test(languageField))) {
     return apiError("Invalid language code", 400);
   }
+
   const hint = form.get("prompt");
   if (hint !== null && typeof hint !== "string") {
     return apiError("Invalid prompt", 400);
-  // Each file is uploaded by OpenLess as a 16-kHz WAV. Other standard audio
   }
-  // formats are forwarded, but must be supported by Cloudflare Whisper.
+
+  // Audio encoding is passed to Cloudflare Whisper, which validates the format.
   const bytes = new Uint8Array(await file.arrayBuffer());
   const input = {
     audio: toBase64(bytes),
     task: "transcribe",
   };
-  const language = languageField || DEFAULT_ASR_LANGUAGE;
+  const language = languageField || settings.defaultAsrLanguage;
   if (language) {
     input.language = language;
   }
-  const initialPrompt = contextPrompt(hint);
+
+  const initialPrompt = contextPrompt(hint, settings);
   if (initialPrompt) {
     input.initial_prompt = initialPrompt;
   }
 
   let upstream;
   try {
-    upstream = await fetch(`${cloudflareAIRoot}/run/${ASR_MODEL}`, {
+    upstream = await fetch(`${cloudflareAIRoot}/run/${settings.asrModel}`, {
       method: "POST",
       headers: { authorization: cloudflareToken, "content-type": "application/json", accept: "application/json" },
       body: JSON.stringify(input),
@@ -542,6 +657,7 @@ async function handleTranscription(request, cloudflareToken, cloudflareAIRoot) {
       headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" },
     });
   }
+
   if (responseFormat === "verbose_json") {
     // OpenLess accepts plain { text } even when segments aren't available.
     return responseJson({ text, task: "transcribe", language: result.language || language || "" });
@@ -558,19 +674,26 @@ export default {
       return apiError(configurationError, 503, "configuration_error");
     }
 
+    let settings;
+    try {
+      settings = getSettings(env);
+    } catch (error) {
+      return apiError(error.message, 503, "configuration_error");
+    }
+
     if (request.method === "GET" && (path === "/" || path === "/health")) {
       return responseJson({
         ok: true,
         service: "handy-openless-cloudflare-gateway",
-        chat_model: CHAT_MODEL,
-        transcription_model: ASR_MODEL,
-        version: "2.7.0",
+        chat_model: settings.chatModel,
+        transcription_model: settings.asrModel,
+        version: "2.8.0",
       });
     }
 
     // Preserve Handy's original model picker (only chat model).
     if (request.method === "GET" && (path === "/v1/models" || path === "/models")) {
-      return responseJson({ object: "list", data: [{ id: CHAT_MODEL, object: "model", created: 0, owned_by: "cloudflare" }] });
+      return responseJson({ object: "list", data: [{ id: settings.chatModel, object: "model", created: 0, owned_by: "cloudflare" }] });
     }
 
     const chat = path === "/v1/chat/completions" || path === "/chat/completions";
@@ -589,7 +712,7 @@ export default {
 
     const cloudflareAIRoot = getCloudflareAIRoot(env.CF_ACCOUNT_ID);
     return chat
-      ? handleChat(request, cloudflareToken, env, cloudflareAIRoot)
-      : handleTranscription(request, cloudflareToken, cloudflareAIRoot);
+      ? handleChat(request, cloudflareToken, env, cloudflareAIRoot, settings)
+      : handleTranscription(request, cloudflareToken, cloudflareAIRoot, settings);
   },
 };
