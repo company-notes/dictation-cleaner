@@ -1,8 +1,8 @@
 /**
- * Cloudflare Workers AI compatibility gateway for Handy, OpenLess and OpenWhispr (v2.6).
+ * Cloudflare Workers AI compatibility gateway for Handy, OpenLess and OpenWhispr (v2.7).
  *
  * Paste entire source into an existing Cloudflare Worker and click Deploy.
- * Clients authenticate with a gateway key; upstream credentials are Worker Secrets.
+ * The client supplies its own Cloudflare Workers AI token as a Bearer header.
  * Cloudflare Workers AI is primary; Groq is used only when Cloudflare reports quota exhaustion.
  */
 
@@ -28,41 +28,16 @@ function getCloudflareAIRoot(accountID) {
 }
 
 function validateConfiguration(env) {
-  const required = ["CF_ACCOUNT_ID", "CF_API_TOKEN", "GATEWAY_API_KEY"];
-  const missing = required.filter(name => typeof env?.[name] !== "string" || !env[name].trim());
-  if (missing.length) {
-    return `Missing Worker settings: ${missing.join(", ")}`;
-  }
-
-  if (!/^[0-9a-f]{32}$/i.test(env.CF_ACCOUNT_ID)) {
-    return "CF_ACCOUNT_ID must contain exactly 32 hexadecimal characters";
-  }
-
-  if (env.GATEWAY_API_KEY.length < 16) {
-    return "GATEWAY_API_KEY must contain at least 16 characters";
-  }
-
-  if (env.GATEWAY_API_KEY === env.CF_API_TOKEN) {
-    return "GATEWAY_API_KEY must differ from CF_API_TOKEN";
+  if (typeof env?.CF_ACCOUNT_ID !== "string" || !/^[0-9a-f]{32}$/i.test(env.CF_ACCOUNT_ID)) {
+    return "Set CF_ACCOUNT_ID to your 32-character Cloudflare Account ID in Worker Variables";
   }
 
   return null;
 }
 
-function authenticateClient(request, expectedKey) {
+function bearerFrom(request) {
   const authorization = request.headers.get("authorization") || "";
-  const match = /^Bearer\s+(\S+)$/i.exec(authorization);
-  if (!match) {
-    return false;
-  }
-
-  const provided = match[1];
-  let difference = provided.length ^ expectedKey.length;
-  for (let i = 0; i < Math.max(provided.length, expectedKey.length); i++) {
-    difference |= (provided.charCodeAt(i) || 0) ^ (expectedKey.charCodeAt(i) || 0);
-  }
-
-  return difference === 0;
+  return /^Bearer\s+\S+$/i.test(authorization) ? authorization : null;
 }
 
 function responseJson(value, status = 200) {
@@ -589,7 +564,7 @@ export default {
         service: "handy-openless-cloudflare-gateway",
         chat_model: CHAT_MODEL,
         transcription_model: ASR_MODEL,
-        version: "2.6.0",
+        version: "2.7.0",
       });
     }
 
@@ -607,15 +582,14 @@ export default {
       return apiError("Method not allowed", 405);
     }
 
-    if (!authenticateClient(request, env.GATEWAY_API_KEY)) {
-      return apiError("Invalid gateway API key", 401, "authentication_error");
+    const cloudflareToken = bearerFrom(request);
+    if (!cloudflareToken) {
+      return apiError("Provide your Cloudflare Workers AI token in the client's API Key field", 401, "authentication_error");
     }
 
-    const cloudflareToken = `Bearer ${env.CF_API_TOKEN}`;
     const cloudflareAIRoot = getCloudflareAIRoot(env.CF_ACCOUNT_ID);
     return chat
       ? handleChat(request, cloudflareToken, env, cloudflareAIRoot)
       : handleTranscription(request, cloudflareToken, cloudflareAIRoot);
   },
 };
-
