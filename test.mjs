@@ -175,8 +175,133 @@ test('debug endpoint is absent, model listing and health are intact', async () =
 
   const health = await gateway.fetch(new Request(`${base}/health`), env);
   assert.equal(health.status, 200);
-  assert.equal((await health.json()).version, '2.7.0');
+  assert.equal((await health.json()).version, '2.8.0');
 
   const listing = await gateway.fetch(new Request(`${base}/v1/models`), env);
   assert.equal((await listing.json()).data[0].id, model);
+});
+
+test('all model and endpoint settings override the defaults', async () => {
+  const custom = {
+    ...env,
+    CHAT_MODEL: '@cf/test/cleaner',
+    GROQ_CHAT_MODEL: 'qwen/custom-fallback',
+    GROQ_CHAT_URL: 'https://alternate.groq.example/openai/v1/chat/completions',
+    ASR_MODEL: '@cf/test/asr',
+    ASR_ALIASES: 'custom-whisper,custom-asr',
+    MAX_CHAT_BYTES: '2048',
+    MAX_AUDIO_BYTES: '128',
+    MAX_MULTIPART_BYTES: '2048',
+    DEFAULT_ASR_LANGUAGE: 'en',
+    ASR_VOCAB_HINT: 'AcmeModel, special tokenizer',
+  };
+
+  const health = await gateway.fetch(new Request(`${base}/health`), custom);
+  const healthData = await health.json();
+  assert.equal(healthData.chat_model, custom.CHAT_MODEL);
+  assert.equal(healthData.transcription_model, custom.ASR_MODEL);
+
+  const listing = await gateway.fetch(new Request(`${base}/v1/models`), custom);
+  assert.equal((await listing.json()).data[0].id, custom.CHAT_MODEL);
+
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    const payload = JSON.parse(options.body);
+    requests.push({ url: String(url), payload });
+
+    if (String(url).includes('alternate.groq.example')) {
+      assert.equal(payload.model, custom.GROQ_CHAT_MODEL);
+      return cloudflareReply('備援成功');
+    }
+
+    if (String(url).includes('/ai/run/')) {
+      assert.match(String(url), /\/run\/@cf\/test\/asr$/);
+      assert.equal(payload.language, 'en');
+      assert.match(payload.initial_prompt, /AcmeModel/);
+      return Response.json({ success: true, result: { text: 'transcribed' } });
+    }
+
+    assert.equal(payload.model, custom.CHAT_MODEL);
+    return quotaReply(3036);
+  };
+
+  const chat = await gateway.fetch(makeRequest('/v1/chat/completions', {
+    ...chatBody(), model: custom.CHAT_MODEL,
+  }), custom);
+  assert.equal(chat.status, 200);
+  assert.equal((await chat.json()).choices[0].message.content, '備援成功');
+  assert.ok(requests.some(call => call.url.includes('alternate.groq.example')));
+
+  const form = new FormData();
+  form.set('model', 'custom-whisper');
+  form.set('file', new Blob([new Uint8Array([82, 73, 70, 70])], { type: 'audio/wav' }), 'test.wav');
+  const transcript = await gateway.fetch(new Request(`${base}/v1/audio/transcriptions`, {
+    method: 'POST', headers: { authorization: `Bearer ${cloudflareKey}` }, body: form,
+  }), custom);
+  assert.equal((await transcript.json()).text, 'transcribed');
+
+  form.set('model', 'whisper-1');
+  const invalidAlias = await gateway.fetch(new Request(`${base}/v1/audio/transcriptions`, {
+    method: 'POST', headers: { authorization: `Bearer ${cloudflareKey}` }, body: form,
+  }), custom);
+  assert.equal(invalidAlias.status, 400);
+});
+
+test('custom limits reject oversized chat and audio requests', async () => {
+  const custom = {
+    ...env,
+    MAX_CHAT_BYTES: '50',
+    MAX_AUDIO_BYTES: '3',
+    MAX_MULTIPART_BYTES: '500',
+  };
+
+  globalThis.fetch = () => {
+    throw new Error('Rejected requests must not reach the upstream API');
+  };
+
+  const chat = await gateway.fetch(makeRequest('/v1/chat/completions', chatBody()), custom);
+  assert.equal(chat.status, 413);
+
+  const form = new FormData();
+  form.set('model', 'whisper-1');
+  form.set('file', new Blob([new Uint8Array([82, 73, 70, 70])], { type: 'audio/wav' }), 'test.wav');
+  const audio = await gateway.fetch(new Request(`${base}/v1/audio/transcriptions`, {
+    method: 'POST', headers: { authorization: `Bearer ${cloudflareKey}` }, body: form,
+  }), custom);
+  assert.equal(audio.status, 413);
+});
+
+test('ASR language and vocabulary can be intentionally empty', async () => {
+  const custom = { ...env, DEFAULT_ASR_LANGUAGE: '', ASR_VOCAB_HINT: '' };
+  globalThis.fetch = async (_url, options) => {
+    const payload = JSON.parse(options.body);
+    assert.equal(Object.hasOwn(payload, 'language'), false);
+    assert.equal(Object.hasOwn(payload, 'initial_prompt'), false);
+    return Response.json({ success: true, result: { text: 'ok' } });
+  };
+
+  const form = new FormData();
+  form.set('model', 'whisper-1');
+  form.set('file', new Blob([new Uint8Array([82, 73, 70, 70])], { type: 'audio/wav' }), 'test.wav');
+  const response = await gateway.fetch(new Request(`${base}/v1/audio/transcriptions`, {
+    method: 'POST', headers: { authorization: `Bearer ${cloudflareKey}` }, body: form,
+  }), custom);
+  assert.equal(response.status, 200);
+});
+
+test('invalid optional settings give a configuration error', async () => {
+  const invalidSettings = [
+    { MAX_CHAT_BYTES: '0' },
+    { MAX_AUDIO_BYTES: 'ABC' },
+    { MAX_AUDIO_BYTES: '10000', MAX_MULTIPART_BYTES: '9999' },
+    { GROQ_CHAT_URL: 'http://insecure.example/v1' },
+    { CHAT_MODEL: '' },
+    { ASR_ALIASES: ',,,' },
+  ];
+
+  for (const change of invalidSettings) {
+    const response = await gateway.fetch(new Request(`${base}/health`), { ...env, ...change });
+    assert.equal(response.status, 503, JSON.stringify(change));
+    assert.equal((await response.json()).error.type, 'configuration_error');
+  }
 });
