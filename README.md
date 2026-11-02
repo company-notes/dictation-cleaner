@@ -6,6 +6,9 @@ This is a single-file Worker. You can deploy it from the Cloudflare dashboard wi
 
 ## How it works
 
+The chat gateway supports **any Cloudflare Workers AI text-generation model that accepts OpenAI Chat Completions**, not just Qwen. The preferred `CHAT_MODEL` is not an allowlist. Authenticated `GET /v1/models` uses Cloudflare's current text-generation catalog; a caller can also submit another valid `@cf/author/model` ID directly. Cloudflare determines whether that model and request parameters are actually supported.
+
+
 ```text
 OpenWhispr / Handy / OpenLess
   ├─ Speech recognition: Groq Whisper (configured directly in the app)
@@ -15,7 +18,7 @@ OpenWhispr / Handy / OpenLess
           Your Cloudflare Worker
                │  CF_ACCOUNT_ID + the same Bearer token
                ▼
-    Cloudflare Workers AI / Qwen3-30B-A3B-FP8 or Qwen3.8-27B
+    Cloudflare Workers AI / selected @cf/... chat model
                └─ Optional: on daily free quota exhaustion only
                   → Groq Qwen3.8-27B (requires GROQ_API_KEY)
 ```
@@ -50,7 +53,8 @@ All settings below can be added under **Settings → Variables and Secrets** as 
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `CHAT_MODEL` | `@cf/qwen/qwen3-30b-a3b-fp8` | Preferred Cloudflare Qwen model; appears first in the picker |
+| `CHAT_MODEL` | `@cf/qwen/qwen3-30b-a3b-fp8` | Preferred Cloudflare model; appears first in the picker; not a restriction |
+| `CHAT_MODELS` | *(empty)* | Optional comma-separated additional model IDs shown if the Cloudflare catalog is unavailable |
 | `GROQ_CHAT_MODEL` | `qwen/qwen3.8-27b` | Groq text fallback model |
 | `GROQ_CHAT_URL` | `https://api.groq.com/openai/v1/chat/completions` | HTTPS Groq chat-completions endpoint |
 | `ASR_MODEL` | `@cf/openai/whisper-large-v3-turbo` | Cloudflare audio transcription model |
@@ -90,7 +94,9 @@ Model           : @cf/qwen/qwen3-30b-a3b-fp8
 Disable thinking: on (if offered)
 ```
 
-The model picker exposes **both** `@cf/qwen/qwen3-30b-a3b-fp8` and `@cf/qwen/qwen3.8-27b`, with `CHAT_MODEL` first. Refresh the list and **explicitly select Qwen3.8** to use it. If OpenWhispr has cached the old model, the old model remains usable; it is not silently changed to Qwen3.8. Custom non-Qwen `CHAT_MODEL` values still expose only that custom model. Specify the base URL ending in `/v1` — **do not** append `/chat/completions`.
+With an API token that has Workers AI Read permission, the model picker requests Cloudflare's **live text-generation model catalog**; `CHAT_MODEL` is listed first. Without a token or catalog permission, it lists `CHAT_MODEL` and any IDs in `CHAT_MODELS`. Refresh the list and **explicitly select** the model you want; changing `CHAT_MODEL` does not overwrite a model already saved in OpenWhispr. Specify the base URL ending in `/v1` — **do not** append `/chat/completions`.
+
+The Worker accepts other syntactically valid `@cf/author/model` IDs even when they are not shown in the picker. Cloudflare decides whether a given model works with Chat Completions; image, embeddings, transcription and other incompatible models cannot be used for text cleanup here. Qwen3 and Qwen3.8 retain their legacy no-thinking behavior; **other models keep their own request parameters**. To show Qwen3.8 even when model-catalog fetching is denied, set `CHAT_MODELS=@cf/qwen/qwen3.8-27b`.
 
 Qwen3 retains its existing `/no_think` behavior; Qwen3.8 uses `chat_template_kwargs.enable_thinking: false` and respects valid low temperatures (for example `0.2`). Both keep the existing Cloudflare daily-quota-only Groq fallback.
 
@@ -113,7 +119,7 @@ OpenWhispr's **Prompt Studio** can customize text cleanup. For example:
 | Method / path | Purpose | Authorization |
 | --- | --- | --- |
 | `GET /health` | Service status, model IDs and version | None; does not expose tokens |
-| `GET /v1/models` | OpenAI-compatible chat model list | None; model metadata only |
+| `GET /v1/models` | OpenAI-compatible model list; live Cloudflare text-generation catalog if token is supplied | Optional Bearer token; catalog listing requires Workers AI Read permission |
 | `POST /v1/chat/completions` | Text cleanup (JSON or SSE) | Your Cloudflare Workers AI Bearer token |
 | `POST /v1/audio/transcriptions` | Optional Cloudflare Whisper adapter | Your Cloudflare Workers AI Bearer token |
 
@@ -121,7 +127,7 @@ The model, chat and audio paths also accept requests without the `/v1` prefix fo
 
 ## Groq fallback
 
-- **Primary:** the Cloudflare model selected by the client; `CHAT_MODEL` controls picker order. For non-streaming requests, the Worker retries the same model once if Cloudflare produces no usable final text.
+- **Primary:** any compatible Cloudflare `@cf/...` chat model selected by the client; `CHAT_MODEL` controls picker order. For non-streaming requests, the Worker retries the same model once if Cloudflare produces no usable final text.
 - **Fallback:** the configured Groq `GROQ_CHAT_MODEL` only on HTTP **429** indicating the Cloudflare daily free quota has been exhausted (error **3036** or the equivalent quota message), and only when `GROQ_API_KEY` is configured.
 - **No automatic fallback:** HTTP 400/401/403, generic 429, capacity error **3040**, or unrelated upstream failures. An unconfigured fallback returns a clear quota error.
 
@@ -132,7 +138,7 @@ Cloudflare and Groq offer different models and have separate quotas, pricing and
 - This is **not** a fully local speech recognition pipeline. Groq Whisper may receive audio, and Cloudflare Workers AI receives transcribed text.
 - A request with a Cloudflare API token is sent over HTTPS to your Worker. The Worker forwards the same token to Cloudflare, which validates it. Anyone with a valid token for your configured account could consume that account's inference quota; do not share tokens publicly.
 - The optional Groq fallback uses `GROQ_API_KEY` stored as a Worker **Secret**. Keep it out of source control.
-- The Worker logs limited response-status/shape metadata for troubleshooting, not transcript text, request headers, API tokens or full model outputs. Cloudflare's platform logs may still contain network metadata.
+- The Worker logs model routing (`[llm-route] selected_model`) and limited response-status/shape metadata (`[cf-chat]` records both `requested_model` and `upstream_model` when Cloudflare provides it); it does **not** log transcript text, request headers, API tokens or full model outputs. Cloudflare's platform logs may still contain network metadata.
 - Revoke any API token that has been posted in a public forum, repository or shared screenshot.
 
 ## Tests
@@ -151,3 +157,8 @@ node --test test.mjs
 - [Cloudflare Worker secrets](https://developers.cloudflare.com/workers/configuration/secrets/)
 - [Groq API](https://console.groq.com/docs/overview)
 - [OpenWhispr](https://github.com/OpenWhispr/openwhispr)
+### Verify the selected model
+
+After deployment, use OpenWhispr for one dictation and inspect Cloudflare Observability logs for `[llm-route] selected_model`. `provider: cloudflare` and the `model` field identify the submitted model; `[cf-chat]` reports `requested_model`, `upstream_model` (if returned), and `upstream_status`. On quota-only Groq failover, `[llm-route] cloudflare_daily_quota_exhausted` explicitly reports the different `fallback_model`. For streaming requests, the selected-model log records the request; the actual model reported by the stream is not parsed.
+
+The live model catalog uses Cloudflare [`GET /accounts/{account_id}/ai/models/search`](https://developers.cloudflare.com/api/resources/ai/subresources/models/methods/list/) with the caller's API token, requesting `task=text-generation`. Listing supports up to five pages of 100 entries; if the request fails, the Worker lists the configured model IDs instead.
