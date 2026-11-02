@@ -6,6 +6,17 @@
  * Cloudflare Workers AI is primary; Groq is used only when Cloudflare reports quota exhaustion.
  */
 
+const QWEN3_MODEL = "@cf/qwen/qwen3-30b-a3b-fp8";
+const QWEN38_MODEL = "@cf/qwen/qwen3.8-27b";
+
+function availableChatModels(settings) {
+  // Preserve single-model behavior for custom, non-Qwen CHAT_MODEL settings.
+  if (![QWEN3_MODEL, QWEN38_MODEL].includes(settings.chatModel)) {
+    return [settings.chatModel];
+  }
+  return [settings.chatModel, ...[QWEN3_MODEL, QWEN38_MODEL].filter(m => m !== settings.chatModel)];
+}
+
 const DEFAULTS = Object.freeze({
   chatModel: "@cf/qwen/qwen3-30b-a3b-fp8",
   groqChatModel: "qwen/qwen3.8-27b",
@@ -412,9 +423,12 @@ async function handleChat(request, cloudflareToken, env, cloudflareAIRoot, setti
     return apiError("messages must be an array", 400);
   }
 
-  if (body.model !== settings.chatModel) {
-    return apiError(`Only ${settings.chatModel} is supported for chat`, 400);
+  const allowedModels = availableChatModels(settings);
+  if (!allowedModels.includes(body.model)) {
+    return apiError(`Chat model must be one of: ${allowedModels.join(", ")}`, 400);
   }
+  const isQwen3 = body.model === QWEN3_MODEL;
+  const isQwen38 = body.model === QWEN38_MODEL;
 
   // Keep Chat Completions inputs compatible with the Cloudflare model.
   delete body.reasoning_effort;
@@ -423,9 +437,10 @@ async function handleChat(request, cloudflareToken, env, cloudflareAIRoot, setti
   delete body.enable_thinking;
   delete body.reasoning_budget;
 
-  // Qwen3 recommends non-greedy decoding; OpenWhispr sometimes sends zero.
-  if (!Number.isFinite(body.temperature) || body.temperature < 0.5) {
-    body.temperature = 0.7;
+  // Keep Qwen3's existing decoding, but respect Qwen3.8 low-temperature cleanup.
+  if (!Number.isFinite(body.temperature) || body.temperature < 0 ||
+      (!isQwen38 && body.temperature < 0.5)) {
+    body.temperature = isQwen38 ? 0.2 : 0.7;
   }
 
   if (!Number.isFinite(body.top_p) || body.top_p <= 0) {
@@ -460,7 +475,11 @@ async function handleChat(request, cloudflareToken, env, cloudflareAIRoot, setti
     return messages;
   }
 
-  body.messages = buildMessages(true);
+  // Legacy Qwen3 uses /no_think; Qwen3.8 uses its chat template flag.
+  body.messages = buildMessages(isQwen3);
+  if (isQwen38) {
+    body.chat_template_kwargs = { enable_thinking: false };
+  }
 
   // Handy normally sends non-streaming requests, while OpenLess needs SSE.
   // Honor each client instead of forcing stream=false for every request.
@@ -549,7 +568,7 @@ async function handleChat(request, cloudflareToken, env, cloudflareAIRoot, setti
       return responseJson(retryResult.response);
     }
 
-    return apiError("Cloudflare Qwen3 gave no final text on soft-only or baseline request; inspect [cf-chat] logs", 502, "upstream_error");
+    return apiError("Cloudflare chat model gave no final text on initial or retry request; inspect [cf-chat] logs", 502, "upstream_error");
   } catch (error) {
     console.warn("[cf-chat] fetch_or_parse_failed", JSON.stringify({name: error?.name || "Error"}));
     return apiError("Cloudflare chat service unreachable or response invalid", 502, "upstream_error");
@@ -687,13 +706,18 @@ export default {
         service: "handy-openless-cloudflare-gateway",
         chat_model: settings.chatModel,
         transcription_model: settings.asrModel,
-        version: "2.8.0",
+        version: "2.9.0",
       });
     }
 
-    // Preserve Handy's original model picker (only chat model).
+    // Expose both Qwen models; the configured model appears first.
     if (request.method === "GET" && (path === "/v1/models" || path === "/models")) {
-      return responseJson({ object: "list", data: [{ id: settings.chatModel, object: "model", created: 0, owned_by: "cloudflare" }] });
+      return responseJson({
+        object: "list",
+        data: availableChatModels(settings).map(id => ({
+          id, object: "model", created: 0, owned_by: "cloudflare",
+        })),
+      });
     }
 
     const chat = path === "/v1/chat/completions" || path === "/chat/completions";

@@ -15,7 +15,7 @@ OpenWhispr / Handy / OpenLess
           Your Cloudflare Worker
                │  CF_ACCOUNT_ID + the same Bearer token
                ▼
-    Cloudflare Workers AI / Qwen3-30B-A3B-FP8
+    Cloudflare Workers AI / Qwen3-30B-A3B-FP8 or Qwen3.8-27B
                └─ Optional: on daily free quota exhaustion only
                   → Groq Qwen3.8-27B (requires GROQ_API_KEY)
 ```
@@ -50,7 +50,7 @@ All settings below can be added under **Settings → Variables and Secrets** as 
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `CHAT_MODEL` | `@cf/qwen/qwen3-30b-a3b-fp8` | Cloudflare text-cleanup model and model ID exposed to clients |
+| `CHAT_MODEL` | `@cf/qwen/qwen3-30b-a3b-fp8` | Preferred Cloudflare Qwen model; appears first in the picker |
 | `GROQ_CHAT_MODEL` | `qwen/qwen3.8-27b` | Groq text fallback model |
 | `GROQ_CHAT_URL` | `https://api.groq.com/openai/v1/chat/completions` | HTTPS Groq chat-completions endpoint |
 | `ASR_MODEL` | `@cf/openai/whisper-large-v3-turbo` | Cloudflare audio transcription model |
@@ -90,7 +90,9 @@ Model           : @cf/qwen/qwen3-30b-a3b-fp8
 Disable thinking: on (if offered)
 ```
 
-If you change the `CHAT_MODEL` Worker variable, enter that same model ID in OpenWhispr. Refresh the model list if needed. Specify the base URL ending in `/v1` — **do not** append `/chat/completions`.
+The model picker exposes **both** `@cf/qwen/qwen3-30b-a3b-fp8` and `@cf/qwen/qwen3.8-27b`, with `CHAT_MODEL` first. Refresh the list and **explicitly select Qwen3.8** to use it. If OpenWhispr has cached the old model, the old model remains usable; it is not silently changed to Qwen3.8. Custom non-Qwen `CHAT_MODEL` values still expose only that custom model. Specify the base URL ending in `/v1` — **do not** append `/chat/completions`.
+
+Qwen3 retains its existing `/no_think` behavior; Qwen3.8 uses `chat_template_kwargs.enable_thinking: false` and respects valid low temperatures (for example `0.2`). Both keep the existing Cloudflare daily-quota-only Groq fallback.
 
 Handy and OpenLess can use the same `/v1` URL, model ID, and their own Cloudflare Workers AI tokens. Chat cleanup accepts JSON responses and streaming SSE; the optional Cloudflare ASR adapter accepts model `whisper-1` by default.
 
@@ -119,7 +121,7 @@ The model, chat and audio paths also accept requests without the `/v1` prefix fo
 
 ## Groq fallback
 
-- **Primary:** the configured Cloudflare `CHAT_MODEL`. For non-streaming requests, the Worker retries the same model once if Cloudflare produces no usable final text.
+- **Primary:** the Cloudflare model selected by the client; `CHAT_MODEL` controls picker order. For non-streaming requests, the Worker retries the same model once if Cloudflare produces no usable final text.
 - **Fallback:** the configured Groq `GROQ_CHAT_MODEL` only on HTTP **429** indicating the Cloudflare daily free quota has been exhausted (error **3036** or the equivalent quota message), and only when `GROQ_API_KEY` is configured.
 - **No automatic fallback:** HTTP 400/401/403, generic 429, capacity error **3040**, or unrelated upstream failures. An unconfigured fallback returns a clear quota error.
 

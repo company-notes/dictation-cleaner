@@ -175,10 +175,10 @@ test('debug endpoint is absent, model listing and health are intact', async () =
 
   const health = await gateway.fetch(new Request(`${base}/health`), env);
   assert.equal(health.status, 200);
-  assert.equal((await health.json()).version, '2.8.0');
+  assert.equal((await health.json()).version, '2.9.0');
 
   const listing = await gateway.fetch(new Request(`${base}/v1/models`), env);
-  assert.equal((await listing.json()).data[0].id, model);
+  assert.deepEqual((await listing.json()).data.map(item => item.id), [model, '@cf/qwen/qwen3.8-27b']);
 });
 
 test('all model and endpoint settings override the defaults', async () => {
@@ -304,4 +304,57 @@ test('invalid optional settings give a configuration error', async () => {
     assert.equal(response.status, 503, JSON.stringify(change));
     assert.equal((await response.json()).error.type, 'configuration_error');
   }
+});
+
+test('Qwen3.8 routing respects non-thinking, low temperature, and cached old-model choice', async () => {
+  const newer = '@cf/qwen/qwen3.8-27b';
+  const settings = { ...env, CHAT_MODEL: newer };
+  const listing = await gateway.fetch(new Request(base + '/v1/models'), settings);
+  assert.deepEqual((await listing.json()).data.map(item => item.id), [newer, model]);
+  const seen = [];
+  globalThis.fetch = async (_url, options) => {
+    seen.push(JSON.parse(options.body));
+    return cloudflareReply();
+  };
+  const result = await gateway.fetch(makeRequest('/v1/chat/completions', {
+    ...chatBody(), model: newer, temperature: 0.2,
+    reasoning_effort: 'none', chat_template_kwargs: { enable_thinking: true },
+  }), settings);
+  assert.equal(result.status, 200);
+  assert.equal(seen[0].temperature, 0.2);
+  assert.equal(seen[0].model, newer);
+  assert.deepEqual(seen[0].chat_template_kwargs, { enable_thinking: false });
+  assert.equal(Object.hasOwn(seen[0], 'reasoning_effort'), false);
+  assert.equal(seen[0].messages[0].content, '嗯，我想測試一下 API。');
+
+  const old = await gateway.fetch(makeRequest('/v1/chat/completions', chatBody()), settings);
+  assert.equal(old.status, 200);
+  assert.equal(seen[1].model, model);
+  assert.match(seen[1].messages[0].content, /\/no_think$/);
+  assert.equal(Object.hasOwn(seen[1], 'chat_template_kwargs'), false);
+
+  const invalid = await gateway.fetch(makeRequest('/v1/chat/completions', {
+    ...chatBody(), model: '@cf/not-supported/model',
+  }), settings);
+  assert.equal(invalid.status, 400);
+  assert.equal(seen.length, 2);
+});
+
+test('Qwen3.8 retry retains non-thinking flag and original messages', async () => {
+  const newer = '@cf/qwen/qwen3.8-27b';
+  const settings = { ...env, CHAT_MODEL: newer };
+  let count = 0;
+  globalThis.fetch = async (_url, options) => {
+    count++;
+    const body = JSON.parse(options.body);
+    assert.deepEqual(body.chat_template_kwargs, { enable_thinking: false });
+    assert.equal(body.messages[0].content, '嗯，我想測試一下 API。');
+    return count === 1 ? cloudflareReply('') : cloudflareReply('重試成功');
+  };
+  const response = await gateway.fetch(makeRequest('/v1/chat/completions', {
+    ...chatBody(), model: newer,
+  }), settings);
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).choices[0].message.content, '重試成功');
+  assert.equal(count, 2);
 });
