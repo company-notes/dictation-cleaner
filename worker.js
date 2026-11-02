@@ -9,12 +9,54 @@
 const QWEN3_MODEL = "@cf/qwen/qwen3-30b-a3b-fp8";
 const QWEN38_MODEL = "@cf/qwen/qwen3.8-27b";
 
-function availableChatModels(settings) {
-  // Preserve single-model behavior for custom, non-Qwen CHAT_MODEL settings.
-  if (![QWEN3_MODEL, QWEN38_MODEL].includes(settings.chatModel)) {
-    return [settings.chatModel];
+// This gateway accepts any Cloudflare model ID; Cloudflare validates support for
+// the Chat Completions endpoint. An embeddings/image/ASR model will be rejected upstream.
+const CF_MODEL_ID = /^@cf\/[a-z0-9_.-]+(?:\/[a-z0-9_.-]+)+$/i;
+
+function configuredChatModels(settings) {
+  return [...new Set([settings.chatModel, ...settings.extraChatModels])];
+}
+
+// Model discovery uses the caller's Cloudflare token, not a Worker secret.
+// If the catalog is unavailable (including missing Read permission), the
+// configured models remain visible, and arbitrary valid IDs are still routable.
+async function availableChatModels(settings, cloudflareAIRoot, cloudflareToken) {
+  const configured = configuredChatModels(settings);
+  if (!cloudflareToken) return configured;
+
+  const discovered = new Set(configured);
+  const perPage = 100;
+  try {
+    for (let page = 1; page <= 5; page++) {
+      const response = await fetch(
+        `${cloudflareAIRoot}/models/search?task=text-generation&per_page=${perPage}&page=${page}`,
+        {
+          method: "GET",
+          headers: { authorization: cloudflareToken, accept: "application/json" },
+          redirect: "manual",
+        },
+      );
+      if (!response.ok) throw new Error(`catalog_http_${response.status}`);
+      const payload = await response.json();
+      if (payload?.success === false || !Array.isArray(payload?.result)) {
+        throw new Error("catalog_invalid_response");
+      }
+      for (const item of payload.result) {
+        const name = typeof item?.name === "string" ? item.name
+          : typeof item?.id === "string" ? item.id : "";
+        if (CF_MODEL_ID.test(name)) discovered.add(name);
+      }
+      const pages = Number(payload?.result_info?.total_pages);
+      if ((Number.isFinite(pages) && pages > 0 && page >= pages) ||
+          payload.result.length < perPage) break;
+    }
+  } catch (error) {
+    console.warn("[cf-models] catalog_unavailable", JSON.stringify({
+      reason: String(error?.message || "unknown").slice(0, 60),
+    }));
+    return configured;
   }
-  return [settings.chatModel, ...[QWEN3_MODEL, QWEN38_MODEL].filter(m => m !== settings.chatModel)];
+  return [...configured, ...[...discovered].filter(id => !configured.includes(id)).sort()];
 }
 
 const DEFAULTS = Object.freeze({
@@ -68,6 +110,11 @@ function positiveInteger(env, key, defaultValue) {
 
 function getSettings(env) {
   const chatModel = nonEmptyText(env, "CHAT_MODEL", DEFAULTS.chatModel);
+  const extraChatModels = optionalText(env, "CHAT_MODELS", "")
+    .split(",").map(model => model.trim()).filter(Boolean);
+  if (![chatModel, ...extraChatModels].every(model => CF_MODEL_ID.test(model))) {
+    throw new Error("CHAT_MODEL and CHAT_MODELS must contain Cloudflare @cf/... model IDs");
+  }
   const groqChatModel = nonEmptyText(env, "GROQ_CHAT_MODEL", DEFAULTS.groqChatModel);
   const groqChatUrl = nonEmptyText(env, "GROQ_CHAT_URL", DEFAULTS.groqChatUrl);
   const asrModel = nonEmptyText(env, "ASR_MODEL", DEFAULTS.asrModel);
@@ -101,6 +148,7 @@ function getSettings(env) {
 
   return {
     chatModel,
+    extraChatModels,
     groqChatModel,
     groqChatUrl,
     asrModel,
@@ -130,13 +178,14 @@ function bearerFrom(request) {
   return /^Bearer\s+\S+$/i.test(authorization) ? authorization : null;
 }
 
-function responseJson(value, status = 200) {
+function responseJson(value, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(value), {
     status,
     headers: {
       "content-type": "application/json; charset=utf-8",
       "cache-control": "no-store",
       "x-content-type-options": "nosniff",
+      ...extraHeaders,
     },
   });
 }
@@ -176,7 +225,7 @@ function contextPrompt(clientPrompt, settings) {
 
 // Never log request prompts, transcripts, responses, tokens, or request headers.
 // Only response shape and field lengths are recorded.
-function recordChatDiagnostics(source, status, data, content, finishReason) {
+function recordChatDiagnostics(source, status, data, content, finishReason, requestedModel) {
   const payload = data && typeof data === "object" ? data : {};
   const core = payload.result && typeof payload.result === "object" ? payload.result : payload;
   const firstChoice = Array.isArray(core.choices) ? core.choices[0] : null;
@@ -185,6 +234,8 @@ function recordChatDiagnostics(source, status, data, content, finishReason) {
 
   console.info("[cf-chat]", JSON.stringify({
     source,
+    requested_model: requestedModel,
+    upstream_model: typeof core.model === "string" ? core.model : null,
     upstream_status: status,
     wrapper_success: payload.success ?? null,
     result_type: Array.isArray(payload.result) ? "array" : typeof payload.result,
@@ -279,7 +330,7 @@ async function readChatJson(response, source, model) {
   }
 
   const unpacked = unpackChatResponse(data, model);
-  recordChatDiagnostics(source, response.status, data, unpacked?.content || "", unpacked?.finishReason);
+  recordChatDiagnostics(source, response.status, data, unpacked?.content || "", unpacked?.finishReason, model);
   return unpacked;
 }
 
@@ -328,7 +379,7 @@ function groqRequestBody(originalMessages, cloudflareBody, wantsStream, settings
     temperature: 0.7,
     top_p: 0.8,
     max_tokens: Math.min(Math.max(cloudflareBody.max_tokens || 1024, 1024), 4096),
-    reasoning_effort: "none",
+    ...(/qwen3(?:\\.|-|$)/i.test(settings.groqChatModel) ? { reasoning_effort: "none" } : {}),
   };
 }
 
@@ -338,7 +389,11 @@ async function runGroqFallback(env, originalMessages, cfBody, wantsStream, setti
     return apiError("Cloudflare daily quota reached; set GROQ_API_KEY Worker secret to enable Groq fallback", 429, "quota_exceeded");
   }
 
-  console.info("[llm-route] cloudflare_daily_quota_exhausted falling_back_to_groq");
+  console.info("[llm-route] cloudflare_daily_quota_exhausted", JSON.stringify({
+    requested_model: cfBody.model,
+    provider: "groq-fallback",
+    fallback_model: settings.groqChatModel,
+  }));
   try {
     const fallback = await fetch(settings.groqChatUrl, {
       method: "POST",
@@ -423,34 +478,35 @@ async function handleChat(request, cloudflareToken, env, cloudflareAIRoot, setti
     return apiError("messages must be an array", 400);
   }
 
-  const allowedModels = availableChatModels(settings);
-  if (!allowedModels.includes(body.model)) {
-    return apiError(`Chat model must be one of: ${allowedModels.join(", ")}`, 400);
+  if (typeof body.model !== "string" || !CF_MODEL_ID.test(body.model)) {
+    return apiError("model must be a Cloudflare Workers AI ID in @cf/author/model format", 400);
   }
   const isQwen3 = body.model === QWEN3_MODEL;
   const isQwen38 = body.model === QWEN38_MODEL;
 
-  // Keep Chat Completions inputs compatible with the Cloudflare model.
-  delete body.reasoning_effort;
-  delete body.reasoning;
-  delete body.chat_template_kwargs;
-  delete body.enable_thinking;
-  delete body.reasoning_budget;
+  // Only apply Qwen-specific settings to those two models. Other Cloudflare
+  // text-generation models receive the client's parameters unchanged.
+  if (isQwen3 || isQwen38) {
+    delete body.reasoning_effort;
+    delete body.reasoning;
+    delete body.chat_template_kwargs;
+    delete body.enable_thinking;
+    delete body.reasoning_budget;
 
-  // Keep Qwen3's existing decoding, but respect Qwen3.8 low-temperature cleanup.
-  if (!Number.isFinite(body.temperature) || body.temperature < 0 ||
-      (!isQwen38 && body.temperature < 0.5)) {
-    body.temperature = isQwen38 ? 0.2 : 0.7;
-  }
+    if (!Number.isFinite(body.temperature) || body.temperature < 0 ||
+        (isQwen3 && body.temperature < 0.5)) {
+      body.temperature = isQwen38 ? 0.2 : 0.7;
+    }
 
-  if (!Number.isFinite(body.top_p) || body.top_p <= 0) {
-    body.top_p = 0.8;
-  }
+    if (!Number.isFinite(body.top_p) || body.top_p <= 0) {
+      body.top_p = 0.8;
+    }
 
-  if (!Number.isInteger(body.max_tokens) || body.max_tokens < 1024) {
-    body.max_tokens = 1024;
+    if (!Number.isInteger(body.max_tokens) || body.max_tokens < 1024) {
+      body.max_tokens = 1024;
+    }
+    body.max_tokens = Math.min(body.max_tokens, 4096);
   }
-  body.max_tokens = Math.min(body.max_tokens, 4096);
 
   const originalMessages = structuredClone(body.messages);
 
@@ -485,6 +541,10 @@ async function handleChat(request, cloudflareToken, env, cloudflareAIRoot, setti
   // Honor each client instead of forcing stream=false for every request.
   const wantsStream = body.stream === true;
   body.stream = wantsStream;
+
+  console.info("[llm-route] selected_model", JSON.stringify({
+    provider: "cloudflare", model: body.model, stream: wantsStream,
+  }));
 
   try {
     const upstream = await fetch(`${cloudflareAIRoot}/v1/chat/completions`, {
@@ -534,13 +594,18 @@ async function handleChat(request, cloudflareToken, env, cloudflareAIRoot, setti
           "content-type": "text/event-stream; charset=utf-8",
           "cache-control": "no-store",
           "x-content-type-options": "nosniff",
+          "x-llm-provider": "cloudflare",
+          "x-llm-model": body.model,
         },
       });
     }
 
     const parsed = await readChatJson(upstream, "soft_only", body.model);
     if (parsed?.content) {
-      return responseJson(parsed.response);
+      return responseJson(parsed.response, 200, {
+        "x-llm-provider": "cloudflare",
+        "x-llm-model": body.model,
+      });
 
     }
 
@@ -565,7 +630,10 @@ async function handleChat(request, cloudflareToken, env, cloudflareAIRoot, setti
 
     const retryResult = await readChatJson(fallback, "baseline_retry", body.model);
     if (retryResult?.content) {
-      return responseJson(retryResult.response);
+      return responseJson(retryResult.response, 200, {
+        "x-llm-provider": "cloudflare",
+        "x-llm-model": body.model,
+      });
     }
 
     return apiError("Cloudflare chat model gave no final text on initial or retry request; inspect [cf-chat] logs", 502, "upstream_error");
@@ -706,15 +774,20 @@ export default {
         service: "handy-openless-cloudflare-gateway",
         chat_model: settings.chatModel,
         transcription_model: settings.asrModel,
-        version: "2.9.0",
+        version: "3.0.0",
       });
     }
 
-    // Expose both Qwen models; the configured model appears first.
+    // Authenticated clients see Cloudflare's live text-generation catalog.
+    // Without a token or catalog permission, expose configured models only.
     if (request.method === "GET" && (path === "/v1/models" || path === "/models")) {
+      const cloudflareToken = bearerFrom(request);
+      const ids = await availableChatModels(
+        settings, getCloudflareAIRoot(env.CF_ACCOUNT_ID), cloudflareToken,
+      );
       return responseJson({
         object: "list",
-        data: availableChatModels(settings).map(id => ({
+        data: ids.map(id => ({
           id, object: "model", created: 0, owned_by: "cloudflare",
         })),
       });
