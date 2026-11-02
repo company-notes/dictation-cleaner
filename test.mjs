@@ -175,10 +175,10 @@ test('debug endpoint is absent, model listing and health are intact', async () =
 
   const health = await gateway.fetch(new Request(`${base}/health`), env);
   assert.equal(health.status, 200);
-  assert.equal((await health.json()).version, '2.9.0');
+  assert.equal((await health.json()).version, '3.0.0');
 
   const listing = await gateway.fetch(new Request(`${base}/v1/models`), env);
-  assert.deepEqual((await listing.json()).data.map(item => item.id), [model, '@cf/qwen/qwen3.8-27b']);
+  assert.deepEqual((await listing.json()).data.map(item => item.id), [model]);
 });
 
 test('all model and endpoint settings override the defaults', async () => {
@@ -310,7 +310,7 @@ test('Qwen3.8 routing respects non-thinking, low temperature, and cached old-mod
   const newer = '@cf/qwen/qwen3.8-27b';
   const settings = { ...env, CHAT_MODEL: newer };
   const listing = await gateway.fetch(new Request(base + '/v1/models'), settings);
-  assert.deepEqual((await listing.json()).data.map(item => item.id), [newer, model]);
+  assert.deepEqual((await listing.json()).data.map(item => item.id), [newer]);
   const seen = [];
   globalThis.fetch = async (_url, options) => {
     seen.push(JSON.parse(options.body));
@@ -333,11 +333,12 @@ test('Qwen3.8 routing respects non-thinking, low temperature, and cached old-mod
   assert.match(seen[1].messages[0].content, /\/no_think$/);
   assert.equal(Object.hasOwn(seen[1], 'chat_template_kwargs'), false);
 
-  const invalid = await gateway.fetch(makeRequest('/v1/chat/completions', {
+  const anotherModel = await gateway.fetch(makeRequest('/v1/chat/completions', {
     ...chatBody(), model: '@cf/not-supported/model',
   }), settings);
-  assert.equal(invalid.status, 400);
-  assert.equal(seen.length, 2);
+  assert.equal(anotherModel.status, 200);
+  assert.equal(seen[2].model, '@cf/not-supported/model');
+  assert.equal(seen.length, 3);
 });
 
 test('Qwen3.8 retry retains non-thinking flag and original messages', async () => {
@@ -357,4 +358,94 @@ test('Qwen3.8 retry retains non-thinking flag and original messages', async () =
   assert.equal(response.status, 200);
   assert.equal((await response.json()).choices[0].message.content, '重試成功');
   assert.equal(count, 2);
+});
+
+test('authenticated model list discovers Cloudflare text-generation models and preserves preferred order', async () => {
+  const urls = [];
+  globalThis.fetch = async (url, options) => {
+    urls.push(String(url));
+    assert.equal(options.headers.authorization, `Bearer ${cloudflareKey}`);
+    assert.match(String(url), /models\/search\?task=text-generation/);
+    const page = Number(new URL(url).searchParams.get('page'));
+    if (page === 1) return Response.json({
+      success: true, result_info: { total_pages: 2 },
+      result: [
+        { name: '@cf/meta/llama-3.1-8b-instruct' },
+        { name: model },
+        { name: '@cf/baai/bge-base-en-v1.5' }, // Catalog task filter normally excludes embeddings.
+      ],
+    });
+    return Response.json({
+      success: true, result_info: { total_pages: 2 },
+      result: [{ name: '@cf/qwen/qwen3.8-27b' }],
+    });
+  };
+  const request = new Request(base + '/v1/models', {
+    headers: { authorization: `Bearer ${cloudflareKey}` },
+  });
+  const response = await gateway.fetch(request, env);
+  assert.equal(response.status, 200);
+  const names = (await response.json()).data.map(item => item.id);
+  assert.equal(names[0], model);
+  assert.ok(names.includes('@cf/meta/llama-3.1-8b-instruct'));
+  assert.ok(names.includes('@cf/qwen/qwen3.8-27b'));
+  assert.equal(urls.length, 2);
+});
+
+test('catalog failure leaves configured models selectable and permits arbitrary Cloudflare models', async () => {
+  const custom = { ...env, CHAT_MODELS: '@cf/meta/llama-3.3-70b-instruct-fp8-fast' };
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes('/models/search')) return Response.json({ error: 'no permission' }, { status: 403 });
+    assert.equal(JSON.parse(options.body).model, '@cf/mistral/mistral-7b-instruct-v0.2');
+    return cloudflareReply('ok');
+  };
+  const listing = await gateway.fetch(new Request(base + '/models', {
+    headers: { authorization: `Bearer ${cloudflareKey}` },
+  }), custom);
+  assert.deepEqual((await listing.json()).data.map(x => x.id), [
+    model, '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+  ]);
+  const chat = await gateway.fetch(makeRequest('/v1/chat/completions', {
+    ...chatBody(), model: '@cf/mistral/mistral-7b-instruct-v0.2',
+  }), custom);
+  assert.equal(chat.status, 200);
+});
+
+test('other models retain their own decoding and reasoning parameters and are logged', async () => {
+  const inputModel = '@cf/meta/llama-3.1-8b-instruct';
+  const logs = [];
+  const originalInfo = console.info;
+  console.info = (...parts) => { logs.push(parts.join(' ')); };
+  try {
+    globalThis.fetch = async (_url, options) => {
+      const body = JSON.parse(options.body);
+      assert.equal(body.model, inputModel);
+      assert.equal(body.temperature, 0.15);
+      assert.equal(body.top_p, 0.93);
+      assert.equal(body.max_tokens, 128);
+      assert.equal(body.reasoning_effort, 'low');
+      assert.deepEqual(body.chat_template_kwargs, { custom: true });
+      assert.equal(body.messages[0].content, '嗯，我想測試一下 API。');
+      return Response.json({
+        model: inputModel, choices: [{ message: { role: 'assistant', content: 'fine' }, finish_reason: 'stop' }],
+      });
+    };
+    const reply = await gateway.fetch(makeRequest('/v1/chat/completions', {
+      ...chatBody(), model: inputModel, temperature: 0.15, top_p: 0.93,
+      max_tokens: 128, reasoning_effort: 'low', chat_template_kwargs: { custom: true },
+    }), env);
+    assert.equal(reply.status, 200);
+    assert.equal(reply.headers.get('x-llm-model'), inputModel);
+    assert.equal(reply.headers.get('x-llm-provider'), 'cloudflare');
+    assert.ok(logs.some(line => line.includes('[llm-route] selected_model') && line.includes(inputModel)));
+    assert.ok(logs.some(line => line.includes('[cf-chat]') && line.includes('"upstream_model":"'+inputModel+'"')));
+  } finally { console.info = originalInfo; }
+});
+
+test('model id validation refuses non-Cloudflare providers', async () => {
+  globalThis.fetch = () => { throw new Error('should not fetch'); };
+  const reply = await gateway.fetch(makeRequest('/v1/chat/completions', {
+    ...chatBody(), model: 'gpt-4o',
+  }), env);
+  assert.equal(reply.status, 400);
 });
