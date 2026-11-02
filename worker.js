@@ -47,8 +47,11 @@ async function availableChatModels(settings, cloudflareAIRoot, cloudflareToken) 
         if (CF_MODEL_ID.test(name)) discovered.add(name);
       }
       const pages = Number(payload?.result_info?.total_pages);
-      if ((Number.isFinite(pages) && pages > 0 && page >= pages) ||
-          payload.result.length < perPage) break;
+      if (Number.isFinite(pages) && pages > 0) {
+        if (page >= pages) break;
+      } else if (payload.result.length < perPage) {
+        break;
+      }
     }
   } catch (error) {
     console.warn("[cf-models] catalog_unavailable", JSON.stringify({
