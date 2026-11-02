@@ -379,7 +379,7 @@ function groqRequestBody(originalMessages, cloudflareBody, wantsStream, settings
     temperature: 0.7,
     top_p: 0.8,
     max_tokens: Math.min(Math.max(cloudflareBody.max_tokens || 1024, 1024), 4096),
-    ...(/qwen3(?:\\.|-|$)/i.test(settings.groqChatModel) ? { reasoning_effort: "none" } : {}),
+    ...(settings.groqChatModel.startsWith("qwen/qwen3.8") ? { reasoning_effort: "none" } : {}),
   };
 }
 
