@@ -6,7 +6,7 @@
  * Cloudflare Workers AI is primary; Groq is used only when Cloudflare reports quota exhaustion.
  */
 
-const QWEN3_MODEL = "@cf/qwen/qwen3-30b-a3b-fp8";
+const GEMMA4_MODEL = "@cf/google/gemma-4-26b-a4b-it";
 const QWEN38_MODEL = "@cf/qwen/qwen3.8-27b";
 
 // This gateway accepts any Cloudflare model ID; Cloudflare validates support for
@@ -63,7 +63,7 @@ async function availableChatModels(settings, cloudflareAIRoot, cloudflareToken) 
 }
 
 const DEFAULTS = Object.freeze({
-  chatModel: "@cf/qwen/qwen3-30b-a3b-fp8",
+  chatModel: GEMMA4_MODEL,
   groqChatModel: "qwen/qwen3.8-27b",
   groqChatUrl: "https://api.groq.com/openai/v1/chat/completions",
   asrModel: "@cf/openai/whisper-large-v3-turbo",
@@ -226,8 +226,19 @@ function contextPrompt(clientPrompt, settings) {
   return [local, settings.asrVocabHint].filter(Boolean).join(", ").slice(0, 240);
 }
 
-// Never log request prompts, transcripts, responses, tokens, or request headers.
-// Only response shape and field lengths are recorded.
+// Never log request prompts, transcripts, responses, API tokens, or request headers.
+// Usage counters are upstream-reported metadata, not token text.
+function usageDiagnostics(usage) {
+  const count = value => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+  return {
+    prompt_tokens: count(usage?.prompt_tokens),
+    completion_tokens: count(usage?.completion_tokens),
+    total_tokens: count(usage?.total_tokens),
+    cached_tokens: count(usage?.prompt_tokens_details?.cached_tokens ?? usage?.cached_tokens),
+    neurons: count(usage?.neurons),
+  };
+}
+
 function recordChatDiagnostics(source, status, data, content, finishReason, requestedModel) {
   const payload = data && typeof data === "object" ? data : {};
   const core = payload.result && typeof payload.result === "object" ? payload.result : payload;
@@ -249,6 +260,54 @@ function recordChatDiagnostics(source, status, data, content, finishReason, requ
     finish_reason: String(finishReason ?? firstChoice?.finish_reason ?? "none").slice(0, 35),
     has_errors: Boolean(payload.error || (Array.isArray(payload.errors) && payload.errors.length)),
     has_usage: Boolean(core.usage),
+    ...usageDiagnostics(core.usage),
+  }));
+}
+
+// Observe SSE metadata without changing the bytes delivered to the client.
+// If the upstream omits usage, all counters remain null rather than pretending zero.
+function observeChatStream(body, source, requestedModel) {
+  if (!body?.pipeThrough || typeof TransformStream !== "function") return body;
+  const decoder = new TextDecoder();
+  let line = "";
+  let dropping = false;
+  let usage = null;
+  let upstreamModel = null;
+  function processLine(value) {
+    if (!value.startsWith("data:")) return;
+    try {
+      const data = JSON.parse(value.slice(5).trim());
+      if (typeof data?.model === "string") upstreamModel = data.model;
+      if (data?.usage && typeof data.usage === "object") usage = data.usage;
+    } catch { /* [DONE] and non-JSON events are not usage records. */ }
+  }
+  function observe(text) {
+    const parts = text.split("\n");
+    for (let i = 0; i < parts.length; i++) {
+      if (!dropping) {
+        line += parts[i];
+        if (line.length > 262144) { line = ""; dropping = true; }
+      }
+      if (i < parts.length - 1) {
+        if (!dropping) processLine(line);
+        line = "";
+        dropping = false;
+      }
+    }
+  }
+  return body.pipeThrough(new TransformStream({
+    transform(chunk, controller) {
+      controller.enqueue(chunk);
+      observe(decoder.decode(chunk, { stream: true }));
+    },
+    flush() {
+      observe(decoder.decode());
+      if (line && !dropping) processLine(line);
+      console.info("[cf-chat]", JSON.stringify({
+        source, requested_model: requestedModel, upstream_model: upstreamModel,
+        upstream_status: 200, has_usage: Boolean(usage), ...usageDiagnostics(usage),
+      }));
+    },
   }));
 }
 
@@ -372,8 +431,31 @@ async function isCloudflareQuotaExhausted(response) {
   return messages.some(message => /(?:daily free allocation|used up your daily|free allocation of .{0,30}neurons|daily quota exceeded)/i.test(message));
 }
 
+// Cloudflare's retirement changelog documents HTTP 410 / code 5028.
+// Some clients or upstream gateways instead expose model_not_found on HTTP 404.
+async function cloudflareModelError(response, model) {
+  let data = null;
+  try { data = await response.clone().json(); } catch { /* non-JSON HTTP error */ }
+  const codes = [
+    data?.code, data?.error?.code, data?.error?.type, data?.result?.error?.code,
+    ...(Array.isArray(data?.errors) ? data.errors.map(e => e?.code) : []),
+  ];
+  const gone = response.status === 410 || codes.some(code => String(code) === "5028");
+  const missing = response.status === 404 && codes.some(code => String(code).toLowerCase() === "model_not_found");
+  if (!gone && !missing) return null;
+  console.warn("[cf-chat] model_unavailable", JSON.stringify({
+    requested_model: model, upstream_status: response.status,
+    reason: gone ? "model_decommissioned" : "model_not_found",
+  }));
+  return apiError(
+    `Cloudflare model ${model} ${gone ? "has been decommissioned" : "was not found"}. Refresh the model list and select an available model, such as ${GEMMA4_MODEL}. Update CHAT_MODEL or CHAT_MODELS if they reference an unavailable model.`,
+    gone ? 410 : 404,
+    gone ? "model_decommissioned" : "model_not_found",
+  );
+}
+
 function groqRequestBody(originalMessages, cloudflareBody, wantsStream, settings) {
-  // Do not reuse Cloudflare-specific model name or /no_think message modification.
+  // Do not reuse Cloudflare-specific model names or chat template parameters.
   // Groq's current Qwen 3.8 supports disabling reasoning with reasoning_effort:none.
   return {
     model: settings.groqChatModel,
@@ -439,7 +521,7 @@ async function runGroqFallback(env, originalMessages, cfBody, wantsStream, setti
         });
       }
 
-      return new Response(fallback.body, {
+      return new Response(observeChatStream(fallback.body, "groq_stream", settings.groqChatModel), {
         status: 200,
         headers: { ...headers, "content-type": "text/event-stream; charset=utf-8" },
       });
@@ -484,61 +566,37 @@ async function handleChat(request, cloudflareToken, env, cloudflareAIRoot, setti
   if (typeof body.model !== "string" || !CF_MODEL_ID.test(body.model)) {
     return apiError("model must be a Cloudflare Workers AI ID in @cf/author/model format", 400);
   }
-  const isQwen3 = body.model === QWEN3_MODEL;
   const isQwen38 = body.model === QWEN38_MODEL;
+  const isGemma4 = body.model === GEMMA4_MODEL;
 
-  // Only apply Qwen-specific settings to those two models. Other Cloudflare
-  // text-generation models receive the client's parameters unchanged.
-  if (isQwen3 || isQwen38) {
+  // Both supported templates allow thinking to be disabled for fast dictation.
+  // All other models receive client parameters unchanged.
+  if (isQwen38 || isGemma4) {
     delete body.reasoning_effort;
     delete body.reasoning;
-    delete body.chat_template_kwargs;
     delete body.enable_thinking;
     delete body.reasoning_budget;
+    const template = body.chat_template_kwargs;
+    body.chat_template_kwargs = {
+      ...(template && typeof template === "object" && !Array.isArray(template) ? template : {}),
+      enable_thinking: false,
+    };
 
-    if (!Number.isFinite(body.temperature) || body.temperature < 0 ||
-        (isQwen3 && body.temperature < 0.5)) {
-      body.temperature = isQwen38 ? 0.2 : 0.7;
+    if (isQwen38) {
+      if (!Number.isFinite(body.temperature) || body.temperature < 0) {
+        body.temperature = 0.2;
+      }
+      if (!Number.isFinite(body.top_p) || body.top_p <= 0) {
+        body.top_p = 0.8;
+      }
+      if (!Number.isInteger(body.max_tokens) || body.max_tokens < 1024) {
+        body.max_tokens = 1024;
+      }
+      body.max_tokens = Math.min(body.max_tokens, 4096);
     }
-
-    if (!Number.isFinite(body.top_p) || body.top_p <= 0) {
-      body.top_p = 0.8;
-    }
-
-    if (!Number.isInteger(body.max_tokens) || body.max_tokens < 1024) {
-      body.max_tokens = 1024;
-    }
-    body.max_tokens = Math.min(body.max_tokens, 4096);
   }
 
   const originalMessages = structuredClone(body.messages);
-
-  // Ask Qwen3 to return a final answer without exposing reasoning text.
-  function buildMessages(softSwitch) {
-    const messages = structuredClone(originalMessages);
-    if (!softSwitch) {
-      return messages;
-    }
-
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
-      if (msg?.role === "user" && typeof msg.content === "string") {
-        if (!/\/no_think\s*$/i.test(msg.content)) {
-          msg.content += "\n/no_think";
-        }
-
-        break;
-      }
-    }
-
-    return messages;
-  }
-
-  // Legacy Qwen3 uses /no_think; Qwen3.8 uses its chat template flag.
-  body.messages = buildMessages(isQwen3);
-  if (isQwen38) {
-    body.chat_template_kwargs = { enable_thinking: false };
-  }
 
   // Handy normally sends non-streaming requests, while OpenLess needs SSE.
   // Honor each client instead of forcing stream=false for every request.
@@ -566,7 +624,9 @@ async function handleChat(request, cloudflareToken, env, cloudflareAIRoot, setti
     }
 
     if (!upstream.ok) {
-      console.warn("[cf-chat] upstream_http_failure", JSON.stringify({ status: upstream.status }));
+      const modelError = await cloudflareModelError(upstream, body.model);
+      if (modelError) return modelError;
+      console.warn("[cf-chat] upstream_http_failure", JSON.stringify({ status: upstream.status, requested_model: body.model }));
       return apiError(`Cloudflare returned HTTP ${upstream.status}`, upstream.status, "upstream_error");
     }
 
@@ -591,7 +651,7 @@ async function handleChat(request, cloudflareToken, env, cloudflareAIRoot, setti
         return apiError("Cloudflare stream returned no usable content; inspect [cf-chat] Worker log", 502, "upstream_error");
       }
 
-      return new Response(upstream.body, {
+      return new Response(observeChatStream(upstream.body, "cloudflare_stream", body.model), {
         status: upstream.status,
         headers: {
           "content-type": "text/event-stream; charset=utf-8",
@@ -603,7 +663,7 @@ async function handleChat(request, cloudflareToken, env, cloudflareAIRoot, setti
       });
     }
 
-    const parsed = await readChatJson(upstream, "soft_only", body.model);
+    const parsed = await readChatJson(upstream, "initial", body.model);
     if (parsed?.content) {
       return responseJson(parsed.response, 200, {
         "x-llm-provider": "cloudflare",
@@ -614,7 +674,7 @@ async function handleChat(request, cloudflareToken, env, cloudflareAIRoot, setti
 
     // Retry the same model with the original user message if cleanup returned no text.
     console.warn("[cf-chat] empty_final_retry_baseline_same_model");
-    const baselineBody = { ...body, messages: buildMessages(false) };
+    const baselineBody = { ...body, messages: originalMessages };
     const fallback = await fetch(`${cloudflareAIRoot}/v1/chat/completions`, {
       method: "POST",
       headers: { authorization: cloudflareToken, "content-type": "application/json", accept: "application/json" },
@@ -627,7 +687,9 @@ async function handleChat(request, cloudflareToken, env, cloudflareAIRoot, setti
     }
 
     if (!fallback.ok) {
-      console.warn("[cf-chat] baseline_http_failure", JSON.stringify({ status: fallback.status }));
+      const modelError = await cloudflareModelError(fallback, body.model);
+      if (modelError) return modelError;
+      console.warn("[cf-chat] baseline_http_failure", JSON.stringify({ status: fallback.status, requested_model: body.model }));
       return apiError(`Cloudflare baseline retry returned HTTP ${fallback.status}`, 502, "upstream_error");
     }
 
@@ -777,7 +839,7 @@ export default {
         service: "handy-openless-cloudflare-gateway",
         chat_model: settings.chatModel,
         transcription_model: settings.asrModel,
-        version: "3.0.0",
+        version: "3.1.0",
       });
     }
 
