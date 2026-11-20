@@ -53,7 +53,7 @@ All settings below can be added under **Settings → Variables and Secrets** as 
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `CHAT_MODEL` | `@cf/qwen/qwen3-30b-a3b-fp8` | Preferred Cloudflare model; appears first in the picker; not a restriction |
+| `CHAT_MODEL` | `@cf/google/gemma-4-26b-a4b-it` | Preferred Cloudflare model; appears first in the picker; not a restriction |
 | `CHAT_MODELS` | *(empty)* | Optional comma-separated additional model IDs shown if the Cloudflare catalog is unavailable |
 | `GROQ_CHAT_MODEL` | `qwen/qwen3.8-27b` | Groq text fallback model |
 | `GROQ_CHAT_URL` | `https://api.groq.com/openai/v1/chat/completions` | HTTPS Groq chat-completions endpoint |
@@ -90,15 +90,21 @@ In **Settings → AI Models → Language Model → Dictation Cleanup**, enable t
 ```text
 Endpoint URL    : https://YOUR-WORKER.YOUR-SUBDOMAIN.workers.dev/v1
 API Key         : your Cloudflare Workers AI API token
-Model           : @cf/qwen/qwen3-30b-a3b-fp8
+Model           : @cf/google/gemma-4-26b-a4b-it
 Disable thinking: on (if offered)
 ```
 
 With an API token that has Workers AI Read permission, the model picker requests Cloudflare's **live text-generation model catalog**; `CHAT_MODEL` is listed first. Without a token or catalog permission, it lists `CHAT_MODEL` and any IDs in `CHAT_MODELS`. Refresh the list and **explicitly select** the model you want; changing `CHAT_MODEL` does not overwrite a model already saved in OpenWhispr. Specify the base URL ending in `/v1` — **do not** append `/chat/completions`.
 
-The Worker accepts other syntactically valid `@cf/author/model` IDs even when they are not shown in the picker. Cloudflare decides whether a given model works with Chat Completions; image, embeddings, transcription and other incompatible models cannot be used for text cleanup here. Qwen3 and Qwen3.8 retain their legacy no-thinking behavior; **other models keep their own request parameters**. To show Qwen3.8 even when model-catalog fetching is denied, set `CHAT_MODELS=@cf/qwen/qwen3.8-27b`.
+The Worker accepts other syntactically valid `@cf/author/model` IDs even when they are not shown in the picker. Cloudflare decides whether a given model works with Chat Completions; image, embeddings, transcription and other incompatible models cannot be used for text cleanup here. Gemma 4 and Qwen3.8 use their chat templates to disable thinking; **other models keep their own request parameters**. To show Qwen3.8 even when model-catalog fetching is denied, set `CHAT_MODELS=@cf/qwen/qwen3.8-27b`.
 
-Qwen3 retains its existing `/no_think` behavior; Qwen3.8 uses `chat_template_kwargs.enable_thinking: false` and respects valid low temperatures (for example `0.2`). Both keep the existing Cloudflare daily-quota-only Groq fallback.
+Gemma 4 and Qwen3.8 both use `chat_template_kwargs.enable_thinking: false` for dictation cleanup. Qwen3.8 retains its low-temperature compatibility settings; Gemma 4 preserves the client's decoding/output-token settings. All supported Cloudflare models keep the existing daily-quota-only Groq fallback.
+
+### Model retirement and migration (November 20, 2026)
+
+Cloudflare has [announced retirement of several models](https://developers.cloudflare.com/changelog/post/2026-11-05-planned-model-deprecations/), including `@cf/qwen/qwen3-30b-a3b-fp8`, with HTTP 410 / error 5028. Version 3.1.0 changes the default to Gemma 4 and removes the legacy Qwen3 prompt-switch behavior. Update any explicitly configured `CHAT_MODEL` or `CHAT_MODELS` values that reference retired models, refresh the app's picker, and explicitly select a supported model. A retired model produces a clear error, not a silent retry with a different model or a Groq failover.
+
+Gemma 4 is the recommended starting point for frequent dictation; Qwen3.8 remains selectable for comparison. Check the [current Cloudflare pricing table](https://developers.cloudflare.com/workers-ai/platform/pricing/) and actual `usage.neurons` counters before choosing a model. Costs depend on input, output, caching and actual usage; no quality or cost guarantee is implied.
 
 Handy and OpenLess can use the same `/v1` URL, model ID, and their own Cloudflare Workers AI tokens. Chat cleanup accepts JSON responses and streaming SSE; the optional Cloudflare ASR adapter accepts model `whisper-1` by default.
 
@@ -129,7 +135,7 @@ The model, chat and audio paths also accept requests without the `/v1` prefix fo
 
 - **Primary:** any compatible Cloudflare `@cf/...` chat model selected by the client; `CHAT_MODEL` controls picker order. For non-streaming requests, the Worker retries the same model once if Cloudflare produces no usable final text.
 - **Fallback:** the configured Groq `GROQ_CHAT_MODEL` only on HTTP **429** indicating the Cloudflare daily free quota has been exhausted (error **3036** or the equivalent quota message), and only when `GROQ_API_KEY` is configured.
-- **No automatic fallback:** HTTP 400/401/403, generic 429, capacity error **3040**, or unrelated upstream failures. An unconfigured fallback returns a clear quota error.
+- **No automatic fallback:** model retirement/not found (including HTTP 410/5028 or 404/model_not_found), HTTP 400/401/403, generic 429, capacity error **3040**, or unrelated upstream failures. An unconfigured fallback returns a clear quota error.
 
 Cloudflare and Groq offer different models and have separate quotas, pricing and privacy terms. A fallback request forwards the text and cleanup instructions to Groq; it does not send the original audio recording. Model availability and free limits can change.
 
@@ -159,6 +165,10 @@ node --test test.mjs
 - [OpenWhispr](https://github.com/OpenWhispr/openwhispr)
 ### Verify the selected model
 
-After deployment, use OpenWhispr for one dictation and inspect Cloudflare Observability logs for `[llm-route] selected_model`. `provider: cloudflare` and the `model` field identify the submitted model; `[cf-chat]` reports `requested_model`, `upstream_model` (if returned), and `upstream_status`. On quota-only Groq failover, `[llm-route] cloudflare_daily_quota_exhausted` explicitly reports the different `fallback_model`. For streaming requests, the selected-model log records the request; the actual model reported by the stream is not parsed.
+After deployment, use OpenWhispr for one dictation and inspect Cloudflare Observability logs for `[llm-route] selected_model`. `provider: cloudflare` and the `model` field identify the submitted model; `[cf-chat]` reports `requested_model`, `upstream_model` (if returned), and `upstream_status`. On quota-only Groq failover, `[llm-route] cloudflare_daily_quota_exhausted` explicitly reports the different `fallback_model`. For streaming requests, the gateway passes SSE bytes through unchanged and observes model and usage metadata when present. A stream that ends early or omits usage may not provide all counters.
+
+### Monitor daily inference usage
+
+Inspect Cloudflare Observability logs for `[cf-chat]`. Each JSON inference attempt, including the same-model retry, logs `prompt_tokens`, `completion_tokens`, `total_tokens`, `cached_tokens`, and `neurons` from the actual upstream `usage` object. Completed SSE streams also log available usage counters without buffering the whole response; usage is not forced on unsupported providers. An unavailable counter is `null`, not zero. Groq does not report Cloudflare Neurons; its corresponding field will normally be null. These diagnostic logs add no inference requests and do not record transcript or prompt text. Use the Cloudflare dashboard for account-level totals. A retry is a separate inference attempt, so count its usage too.
 
 The live model catalog uses Cloudflare [`GET /accounts/{account_id}/ai/models/search`](https://developers.cloudflare.com/api/resources/ai/subresources/models/methods/list/) with the caller's API token, requesting `task=text-generation`. Listing supports up to five pages of 100 entries; if the request fails, the Worker lists the configured model IDs instead.
