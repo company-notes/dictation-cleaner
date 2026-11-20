@@ -8,7 +8,7 @@ const env = {
   CF_ACCOUNT_ID: accountID,
   GROQ_API_KEY: 'groq-test-token-not-real',
 };
-const model = '@cf/qwen/qwen3-30b-a3b-fp8';
+const model = '@cf/google/gemma-4-26b-a4b-it';
 const base = 'https://example.workers.dev';
 
 function makeRequest(path, body, token = cloudflareKey) {
@@ -175,7 +175,7 @@ test('debug endpoint is absent, model listing and health are intact', async () =
 
   const health = await gateway.fetch(new Request(`${base}/health`), env);
   assert.equal(health.status, 200);
-  assert.equal((await health.json()).version, '3.0.0');
+  assert.equal((await health.json()).version, '3.1.0');
 
   const listing = await gateway.fetch(new Request(`${base}/v1/models`), env);
   assert.deepEqual((await listing.json()).data.map(item => item.id), [model]);
@@ -306,7 +306,7 @@ test('invalid optional settings give a configuration error', async () => {
   }
 });
 
-test('Qwen3.8 routing respects non-thinking, low temperature, and cached old-model choice', async () => {
+test('Qwen3.8 routing respects non-thinking, low temperature, and explicit Gemma choice', async () => {
   const newer = '@cf/qwen/qwen3.8-27b';
   const settings = { ...env, CHAT_MODEL: newer };
   const listing = await gateway.fetch(new Request(base + '/v1/models'), settings);
@@ -327,11 +327,17 @@ test('Qwen3.8 routing respects non-thinking, low temperature, and cached old-mod
   assert.equal(Object.hasOwn(seen[0], 'reasoning_effort'), false);
   assert.equal(seen[0].messages[0].content, '嗯，我想測試一下 API。');
 
-  const old = await gateway.fetch(makeRequest('/v1/chat/completions', chatBody()), settings);
-  assert.equal(old.status, 200);
+  const gemma = await gateway.fetch(makeRequest('/v1/chat/completions', {
+    ...chatBody(), temperature: 0.1, max_tokens: 128, reasoning_effort: 'none',
+    chat_template_kwargs: { enable_thinking: true, custom: 1 },
+  }), settings);
+  assert.equal(gemma.status, 200);
   assert.equal(seen[1].model, model);
-  assert.match(seen[1].messages[0].content, /\/no_think$/);
-  assert.equal(Object.hasOwn(seen[1], 'chat_template_kwargs'), false);
+  assert.equal(seen[1].messages[0].content, '嗯，我想測試一下 API。');
+  assert.deepEqual(seen[1].chat_template_kwargs, { enable_thinking: false, custom: 1 });
+  assert.equal(seen[1].max_tokens, 128);
+  assert.equal(seen[1].temperature, 0.1);
+  assert.equal(Object.hasOwn(seen[1], 'reasoning_effort'), false);
 
   const anotherModel = await gateway.fetch(makeRequest('/v1/chat/completions', {
     ...chatBody(), model: '@cf/not-supported/model',
@@ -448,4 +454,111 @@ test('model id validation refuses non-Cloudflare providers', async () => {
     ...chatBody(), model: 'gpt-4o',
   }), env);
   assert.equal(reply.status, 400);
+});
+
+test('retired model returns a clear error without retry or Groq fallback', async () => {
+  const retired = '@cf/qwen/qwen3-30b-a3b-fp8';
+  const cases = [
+    [410, { success: false, errors: [{ code: 5028 }] }, 410, 'model_decommissioned'],
+    [404, { error: { code: 'model_not_found' } }, 404, 'model_not_found'],
+    [400, { errors: [{ code: 5028 }] }, 410, 'model_decommissioned'],
+  ];
+  for (const [status, payload, expected, type] of cases) {
+    let calls = 0;
+    globalThis.fetch = async (_url, options) => {
+      calls++;
+      const body = JSON.parse(options.body);
+      assert.equal(body.model, retired);
+      assert.equal(body.messages[0].content, '嗯，我想測試一下 API。');
+      return Response.json(payload, { status });
+    };
+    const response = await gateway.fetch(makeRequest('/v1/chat/completions', {
+      ...chatBody(), model: retired,
+    }), env);
+    assert.equal(response.status, expected);
+    assert.equal((await response.json()).error.type, type);
+    assert.equal(calls, 1);
+  }
+});
+
+test('retirement during an empty-response retry stays a model error', async () => {
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    return calls === 1 ? cloudflareReply('') : Response.json({ errors: [{ code: 5028 }] }, { status: 410 });
+  };
+  const response = await gateway.fetch(makeRequest('/v1/chat/completions', chatBody()), env);
+  assert.equal(response.status, 410);
+  assert.equal((await response.json()).error.type, 'model_decommissioned');
+  assert.equal(calls, 2);
+});
+
+test('usage logs report actual counters for every JSON attempt including retries', async () => {
+  const logs = [];
+  const original = console.info;
+  console.info = (...parts) => { logs.push(parts.join(' ')); };
+  try {
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls++;
+      return Response.json({
+        model,
+        choices: [{ message: { content: calls === 1 ? '' : '整理完成' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 3000, completion_tokens: calls === 1 ? 0 : 50,
+          total_tokens: calls === 1 ? 3000 : 3050, prompt_tokens_details: { cached_tokens: 1000 },
+          neurons: calls === 1 ? 20.5 : 21.86 },
+      });
+    };
+    const response = await gateway.fetch(makeRequest('/v1/chat/completions', chatBody()), env);
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).usage.neurons, 21.86);
+    const rows = logs.filter(x => x.startsWith('[cf-chat] {')).map(x => JSON.parse(x.slice(10)));
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0].source, 'initial');
+    assert.equal(rows[0].completion_tokens, 0);
+    assert.equal(rows[0].neurons, 20.5);
+    assert.equal(rows[1].source, 'baseline_retry');
+    assert.equal(rows[1].prompt_tokens, 3000);
+    assert.equal(rows[1].completion_tokens, 50);
+    assert.equal(rows[1].total_tokens, 3050);
+    assert.equal(rows[1].cached_tokens, 1000);
+    assert.equal(rows[1].neurons, 21.86);
+    assert.ok(!logs.join(' ').includes('整理完成'));
+  } finally { console.info = original; }
+});
+
+test('usage missing from provider is logged as null, not zero', async () => {
+  const logs = [];
+  const original = console.info;
+  console.info = (...parts) => logs.push(parts.join(' '));
+  try {
+    globalThis.fetch = async () => cloudflareReply();
+    const response = await gateway.fetch(makeRequest('/v1/chat/completions', chatBody()), env);
+    assert.equal(response.status, 200);
+    const data = JSON.parse(logs.find(x => x.startsWith('[cf-chat] {')).slice(10));
+    assert.equal(data.has_usage, false);
+    assert.equal(data.neurons, null);
+    assert.equal(data.cached_tokens, null);
+    assert.equal(data.prompt_tokens, null);
+  } finally { console.info = original; }
+});
+
+test('streaming preserves byte-for-byte output while logging final usage when present', async () => {
+  const logs = [];
+  const original = console.info;
+  console.info = (...parts) => logs.push(parts.join(' '));
+  try {
+    const stream = 'data: '+JSON.stringify({ model, choices: [{ delta: {content: '好'} }] })+'\n\n'
+      +'data: '+JSON.stringify({ model, choices: [], usage: { prompt_tokens: 200, completion_tokens: 20, total_tokens: 220, neurons: 2.5 } })+'\n\n'
+      +'data: [DONE]\n\n';
+    globalThis.fetch = async () => new Response(stream, { headers: { 'content-type': 'text/event-stream' } });
+    const response = await gateway.fetch(makeRequest('/v1/chat/completions', chatBody(true)), env);
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), stream);
+    const row = JSON.parse(logs.find(x => x.startsWith('[cf-chat] {')).slice(10));
+    assert.equal(row.source, 'cloudflare_stream');
+    assert.equal(row.neurons, 2.5);
+    assert.equal(row.prompt_tokens, 200);
+    assert.equal(row.upstream_model, model);
+  } finally { console.info = original; }
 });
