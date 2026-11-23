@@ -175,7 +175,7 @@ test('debug endpoint is absent, model listing and health are intact', async () =
 
   const health = await gateway.fetch(new Request(`${base}/health`), env);
   assert.equal(health.status, 200);
-  assert.equal((await health.json()).version, '3.1.0');
+  assert.equal((await health.json()).version, '3.2.0');
 
   const listing = await gateway.fetch(new Request(`${base}/v1/models`), env);
   assert.deepEqual((await listing.json()).data.map(item => item.id), [model]);
@@ -561,4 +561,201 @@ test('streaming preserves byte-for-byte output while logging final usage when pr
     assert.equal(row.prompt_tokens, 200);
     assert.equal(row.upstream_model, model);
   } finally { console.info = original; }
+});
+
+test('delayed hedge is opt-in, with user-configurable guardrails', async () => {
+  for (const change of [
+    { HEDGE_ON_SLOW: 'sometimes' },
+    { HEDGE_DELAY_MS: '0' },
+    { HEDGE_DELAY_MS: '27000' },
+    { HEDGE_OVERALL_TIMEOUT_MS: '29000' },
+    { GROQ_TIMEOUT_MS: 'abc' },
+  ]) {
+    const response = await gateway.fetch(new Request(base + '/health'), { ...env, ...change });
+    assert.equal(response.status, 503, JSON.stringify(change));
+  }
+  const response = await gateway.fetch(new Request(base + '/health'), {
+    ...env, HEDGE_ON_SLOW: 'true', HEDGE_DELAY_MS: '15',
+  });
+  const health = await response.json();
+  assert.equal(health.version, '3.2.0');
+  assert.equal(health.hedge_enabled, true);
+  assert.equal(health.hedge_delay_ms, 15);
+});
+
+test('hedge does not call Groq when Cloudflare succeeds before delay', async () => {
+  let cfCalls = 0;
+  let groqCalls = 0;
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes('api.groq.com')) { groqCalls++; return cloudflareReply('groq'); }
+    cfCalls++;
+    return cloudflareReply('Cloudflare先完成');
+  };
+  const response = await gateway.fetch(makeRequest('/v1/chat/completions', chatBody()), {
+    ...env, HEDGE_ON_SLOW: 'true', HEDGE_DELAY_MS: '30', HEDGE_OVERALL_TIMEOUT_MS: '200',
+    GROQ_TIMEOUT_MS: '100',
+  });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).choices[0].message.content, 'Cloudflare先完成');
+  assert.equal(response.headers.get('x-llm-provider'), 'cloudflare');
+  assert.equal(cfCalls, 1);
+  assert.equal(groqCalls, 0);
+});
+
+test('after delay Groq can win without cancelling Cloudflare early', async () => {
+  let cfAborted = false, groqCalls = 0;
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes('api.groq.com')) {
+      groqCalls++;
+      assert.equal(JSON.parse(options.body).model, 'qwen/qwen3.8-27b');
+      return cloudflareReply('Groq獲勝');
+    }
+    return new Promise((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => {
+        cfAborted = true;
+        reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+      }, { once: true });
+    });
+  };
+  const response = await gateway.fetch(makeRequest('/v1/chat/completions', chatBody()), {
+    ...env, HEDGE_ON_SLOW: 'true', HEDGE_DELAY_MS: '10', HEDGE_OVERALL_TIMEOUT_MS: '250',
+    GROQ_TIMEOUT_MS: '100',
+  });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).choices[0].message.content, 'Groq獲勝');
+  assert.equal(response.headers.get('x-llm-provider'), 'groq-fallback');
+  assert.equal(groqCalls, 1);
+  assert.equal(cfAborted, true);
+});
+
+test('Cloudflare can win after Groq hedge has already started', async () => {
+  let groqStarted = false, groqAborted = false;
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes('api.groq.com')) {
+      groqStarted = true;
+      return new Promise((_resolve, reject) => {
+        options.signal.addEventListener('abort', () => {
+          groqAborted = true;
+          reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+        }, { once: true });
+      });
+    }
+    return new Promise(resolve => {
+      setTimeout(() => resolve(cloudflareReply('Cloudflare後來反超')), 35);
+    });
+  };
+  const response = await gateway.fetch(makeRequest('/v1/chat/completions', chatBody()), {
+    ...env, HEDGE_ON_SLOW: 'true', HEDGE_DELAY_MS: '10', HEDGE_OVERALL_TIMEOUT_MS: '250',
+    GROQ_TIMEOUT_MS: '100',
+  });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).choices[0].message.content, 'Cloudflare後來反超');
+  assert.equal(response.headers.get('x-llm-provider'), 'cloudflare');
+  assert.equal(groqStarted, true);
+  assert.equal(groqAborted, true);
+});
+
+test('an invalid Groq result does not defeat a later valid Cloudflare result', async () => {
+  let groqCalls = 0;
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes('api.groq.com')) {
+      groqCalls++;
+      return cloudflareReply('');
+    }
+    return new Promise(resolve => setTimeout(() => resolve(cloudflareReply('Cloudflare可用文字')), 35));
+  };
+  const response = await gateway.fetch(makeRequest('/v1/chat/completions', chatBody()), {
+    ...env, HEDGE_ON_SLOW: 'true', HEDGE_DELAY_MS: '10', HEDGE_OVERALL_TIMEOUT_MS: '250',
+    GROQ_TIMEOUT_MS: '100',
+  });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).choices[0].message.content, 'Cloudflare可用文字');
+  assert.equal(groqCalls, 1);
+});
+
+test('a Groq timeout leaves Cloudflare racing until it finishes', async () => {
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes('api.groq.com')) {
+      return new Promise((_resolve, reject) => {
+        options.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), {
+          name: 'AbortError',
+        })), { once: true });
+      });
+    }
+    return new Promise(resolve => setTimeout(() => resolve(cloudflareReply('Cloudflare仍然可用')), 55));
+  };
+  const response = await gateway.fetch(makeRequest('/v1/chat/completions', chatBody()), {
+    ...env, HEDGE_ON_SLOW: 'true', HEDGE_DELAY_MS: '5', HEDGE_OVERALL_TIMEOUT_MS: '200',
+    GROQ_TIMEOUT_MS: '15',
+  });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).choices[0].message.content, 'Cloudflare仍然可用');
+});
+
+test('the overall deadline returns before the OpenWhispr timeout when neither responds', async () => {
+  let aborts = 0;
+  globalThis.fetch = async (_url, options) => new Promise((_resolve, reject) => {
+    options.signal.addEventListener('abort', () => {
+      aborts++;
+      reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+    }, { once: true });
+  });
+  const response = await gateway.fetch(makeRequest('/v1/chat/completions', chatBody()), {
+    ...env, HEDGE_ON_SLOW: 'true', HEDGE_DELAY_MS: '5', HEDGE_OVERALL_TIMEOUT_MS: '40',
+    GROQ_TIMEOUT_MS: '30',
+  });
+  assert.equal(response.status, 504);
+  assert.equal((await response.json()).error.type, 'upstream_timeout');
+  assert.equal(aborts, 2);
+});
+
+test('quota failure still calls Groq immediately and model retirement is not automatically hedged', async () => {
+  let groqCalls = 0;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('api.groq.com')) {
+      groqCalls++;
+      return cloudflareReply('Groq額度備援');
+    }
+    return quotaReply(3036);
+  };
+  const settings = {
+    ...env, HEDGE_ON_SLOW: 'true', HEDGE_DELAY_MS: '20', HEDGE_OVERALL_TIMEOUT_MS: '200',
+    GROQ_TIMEOUT_MS: '100',
+  };
+  const response = await gateway.fetch(makeRequest('/v1/chat/completions', chatBody()), settings);
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).choices[0].message.content, 'Groq額度備援');
+  assert.equal(groqCalls, 1);
+  globalThis.fetch = async url => {
+    if (String(url).includes('api.groq.com')) { groqCalls++; return cloudflareReply(); }
+    return Response.json({ errors: [{ code: 5028 }] }, { status: 410 });
+  };
+  const retired = await gateway.fetch(makeRequest('/v1/chat/completions', chatBody()), settings);
+  assert.equal(retired.status, 410);
+  assert.equal(groqCalls, 1);
+});
+
+test('missing Groq secret skips hedge rather than exposing an empty Bearer token', async () => {
+  const { GROQ_API_KEY, ...withoutSecret } = env;
+  globalThis.fetch = async url => {
+    assert.equal(String(url).includes('api.groq.com'), false);
+    return cloudflareReply('只用Cloudflare');
+  };
+  const response = await gateway.fetch(makeRequest('/v1/chat/completions', chatBody()), {
+    ...withoutSecret, HEDGE_ON_SLOW: 'true', HEDGE_DELAY_MS: '10',
+  });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).choices[0].message.content, '只用Cloudflare');
+});
+
+test('streaming requests do not use delayed hedging', async () => {
+  globalThis.fetch = async (url, options) => {
+    assert.equal(String(url).includes('api.groq.com'), false);
+    assert.equal(JSON.parse(options.body).stream, true);
+    return new Response('data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+  };
+  const response = await gateway.fetch(makeRequest('/v1/chat/completions', chatBody(true)), {
+    ...env, HEDGE_ON_SLOW: 'true', HEDGE_DELAY_MS: '10',
+  });
+  assert.equal(response.status, 200);
 });

@@ -57,6 +57,10 @@ All settings below can be added under **Settings → Variables and Secrets** as 
 | `CHAT_MODELS` | *(empty)* | Optional comma-separated additional model IDs shown if the Cloudflare catalog is unavailable |
 | `GROQ_CHAT_MODEL` | `qwen/qwen3.8-27b` | Groq text fallback model |
 | `GROQ_CHAT_URL` | `https://api.groq.com/openai/v1/chat/completions` | HTTPS Groq chat-completions endpoint |
+| `HEDGE_ON_SLOW` | `false` | Set to `true` to start Groq if Cloudflare has not produced usable text by the hedge delay; non-streaming chat only |
+| `HEDGE_DELAY_MS` | `8000` | Delay in milliseconds before starting the parallel Groq request |
+| `GROQ_TIMEOUT_MS` | `12000` | Maximum time to wait for a hedge-initiated Groq response |
+| `HEDGE_OVERALL_TIMEOUT_MS` | `27000` | Total time budget for the race, including the delay; must be ≤ 28000ms to stay under OpenWhispr's 30-second deadline |
 | `ASR_MODEL` | `@cf/openai/whisper-large-v3-turbo` | Cloudflare audio transcription model |
 | `ASR_ALIASES` | `whisper-1,whisper-large-v3-turbo,<ASR_MODEL>` | Comma-separated model names accepted by the ASR adapter; `<ASR_MODEL>` is replaced with the actual `ASR_MODEL` value |
 | `MAX_CHAT_BYTES` | `65536` | Maximum JSON chat request size (bytes) |
@@ -98,7 +102,7 @@ With an API token that has Workers AI Read permission, the model picker requests
 
 The Worker accepts other syntactically valid `@cf/author/model` IDs even when they are not shown in the picker. Cloudflare decides whether a given model works with Chat Completions; image, embeddings, transcription and other incompatible models cannot be used for text cleanup here. Gemma 4 and Qwen3.8 use their chat templates to disable thinking; **other models keep their own request parameters**. To show Qwen3.8 even when model-catalog fetching is denied, set `CHAT_MODELS=@cf/qwen/qwen3.8-27b`.
 
-Gemma 4 and Qwen3.8 both use `chat_template_kwargs.enable_thinking: false` for dictation cleanup. Qwen3.8 retains its low-temperature compatibility settings; Gemma 4 preserves the client's decoding/output-token settings. All supported Cloudflare models keep the existing daily-quota-only Groq fallback.
+Gemma 4 and Qwen3.8 both use `chat_template_kwargs.enable_thinking: false` for dictation cleanup. Qwen3.8 retains its low-temperature compatibility settings; Gemma 4 preserves the client's decoding/output-token settings. All supported Cloudflare models keep the existing daily-quota-only Groq fallback. Optionally, enable a delayed non-streaming hedge to race Cloudflare against Groq without canceling Cloudflare when Groq starts.
 
 ### Model retirement and migration (November 20, 2026)
 
@@ -135,7 +139,15 @@ The model, chat and audio paths also accept requests without the `/v1` prefix fo
 
 - **Primary:** any compatible Cloudflare `@cf/...` chat model selected by the client; `CHAT_MODEL` controls picker order. For non-streaming requests, the Worker retries the same model once if Cloudflare produces no usable final text.
 - **Fallback:** the configured Groq `GROQ_CHAT_MODEL` only on HTTP **429** indicating the Cloudflare daily free quota has been exhausted (error **3036** or the equivalent quota message), and only when `GROQ_API_KEY` is configured.
-- **No automatic fallback:** model retirement/not found (including HTTP 410/5028 or 404/model_not_found), HTTP 400/401/403, generic 429, capacity error **3040**, or unrelated upstream failures. An unconfigured fallback returns a clear quota error.
+- **No automatic fallback with default settings:** model retirement/not found (including HTTP 410/5028 or 404/model_not_found), HTTP 400/401/403, generic 429, capacity error **3040**, or unrelated upstream failures. An unconfigured fallback returns a clear quota error.
+
+### Optional delayed race (slow Cloudflare response)
+
+To enable the behavior for OpenWhispr, add `HEDGE_ON_SLOW=true` under the Worker's Text variables and keep a valid `GROQ_API_KEY` Worker Secret. The default `HEDGE_DELAY_MS=8000` means Cloudflare starts at once; if it has not **finished producing usable text** after eight seconds, the Worker sends the original cleanup messages to Groq **without cancelling Cloudflare**. Whichever provider first returns a valid non-empty final response wins. The losing request is then aborted on a best-effort basis. You may adjust `HEDGE_DELAY_MS` (for example, 10000).
+
+`GROQ_TIMEOUT_MS=12000` limits the secondary request; if it fails, the Cloudflare request continues. `HEDGE_OVERALL_TIMEOUT_MS=27000` bounds the combined wait to finish before the OpenWhispr 30-second non-streaming timeout. This mode applies **only to non-streaming chat completions**, not speech recognition or SSE streaming. Without the Groq secret it logs `[llm-hedge] skipped_missing_groq_secret` and uses the original Cloudflare path. A prompt quota error still triggers the original Groq fallback immediately, while a model-not-found error returned before the hedge delay still fails clearly rather than silently switching providers.
+
+Observability logs include `[llm-hedge] started`, `[llm-hedge] winner` with provider and elapsed time, and timeout warnings; `[cf-chat]` still records usage for completed JSON responses. Both providers may count tokens or generate charges when a hedge starts, **even if one result is discarded and its request is aborted**. Groq has separate rate limits. Default hedging is OFF to avoid unexpected costs; enable it only when you explicitly accept possible duplicate inference charges. No prompt text or API keys are logged.
 
 Cloudflare and Groq offer different models and have separate quotas, pricing and privacy terms. A fallback request forwards the text and cleanup instructions to Groq; it does not send the original audio recording. Model availability and free limits can change.
 
@@ -143,7 +155,7 @@ Cloudflare and Groq offer different models and have separate quotas, pricing and
 
 - This is **not** a fully local speech recognition pipeline. Groq Whisper may receive audio, and Cloudflare Workers AI receives transcribed text.
 - A request with a Cloudflare API token is sent over HTTPS to your Worker. The Worker forwards the same token to Cloudflare, which validates it. Anyone with a valid token for your configured account could consume that account's inference quota; do not share tokens publicly.
-- The optional Groq fallback uses `GROQ_API_KEY` stored as a Worker **Secret**. Keep it out of source control.
+- The optional Groq fallback and delayed hedge use `GROQ_API_KEY` stored as a Worker **Secret**. Keep it out of source control.
 - The Worker logs model routing (`[llm-route] selected_model`) and limited response-status/shape metadata (`[cf-chat]` records both `requested_model` and `upstream_model` when Cloudflare provides it); it does **not** log transcript text, request headers, API tokens or full model outputs. Cloudflare's platform logs may still contain network metadata.
 - Revoke any API token that has been posted in a public forum, repository or shared screenshot.
 

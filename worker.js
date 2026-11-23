@@ -3,7 +3,8 @@
  *
  * Paste entire source into an existing Cloudflare Worker and click Deploy.
  * The client supplies its own Cloudflare Workers AI token as a Bearer header.
- * Cloudflare Workers AI is primary; Groq is used only when Cloudflare reports quota exhaustion.
+ * Cloudflare Workers AI is primary. Groq is used on quota exhaustion, and
+ * optionally as a delayed parallel hedge for slow non-streaming requests.
  */
 
 const GEMMA4_MODEL = "@cf/google/gemma-4-26b-a4b-it";
@@ -64,6 +65,9 @@ async function availableChatModels(settings, cloudflareAIRoot, cloudflareToken) 
 
 const DEFAULTS = Object.freeze({
   chatModel: GEMMA4_MODEL,
+  hedgeDelayMs: 8000,
+  hedgeOverallTimeoutMs: 27000,
+  groqTimeoutMs: 12000,
   groqChatModel: "qwen/qwen3.8-27b",
   groqChatUrl: "https://api.groq.com/openai/v1/chat/completions",
   asrModel: "@cf/openai/whisper-large-v3-turbo",
@@ -118,6 +122,17 @@ function getSettings(env) {
   if (![chatModel, ...extraChatModels].every(model => CF_MODEL_ID.test(model))) {
     throw new Error("CHAT_MODEL and CHAT_MODELS must contain Cloudflare @cf/... model IDs");
   }
+  const hedgeFlag = optionalText(env, "HEDGE_ON_SLOW", "false").trim().toLowerCase();
+  if (!["true", "false"].includes(hedgeFlag)) {
+    throw new Error("HEDGE_ON_SLOW must be true or false");
+  }
+  const hedgeOnSlow = hedgeFlag === "true";
+  const hedgeDelayMs = positiveInteger(env, "HEDGE_DELAY_MS", DEFAULTS.hedgeDelayMs);
+  const hedgeOverallTimeoutMs = positiveInteger(env, "HEDGE_OVERALL_TIMEOUT_MS", DEFAULTS.hedgeOverallTimeoutMs);
+  const groqTimeoutMs = positiveInteger(env, "GROQ_TIMEOUT_MS", DEFAULTS.groqTimeoutMs);
+  if (hedgeDelayMs >= hedgeOverallTimeoutMs || hedgeOverallTimeoutMs > 28000) {
+    throw new Error("HEDGE_DELAY_MS must be smaller than HEDGE_OVERALL_TIMEOUT_MS (max 28000ms for OpenWhispr)");
+  }
   const groqChatModel = nonEmptyText(env, "GROQ_CHAT_MODEL", DEFAULTS.groqChatModel);
   const groqChatUrl = nonEmptyText(env, "GROQ_CHAT_URL", DEFAULTS.groqChatUrl);
   const asrModel = nonEmptyText(env, "ASR_MODEL", DEFAULTS.asrModel);
@@ -152,6 +167,10 @@ function getSettings(env) {
   return {
     chatModel,
     extraChatModels,
+    hedgeOnSlow,
+    hedgeDelayMs,
+    hedgeOverallTimeoutMs,
+    groqTimeoutMs,
     groqChatModel,
     groqChatUrl,
     asrModel,
@@ -542,6 +561,242 @@ async function runGroqFallback(env, originalMessages, cfBody, wantsStream, setti
   }
 }
 
+
+// Opt-in delayed hedging for non-streaming chat requests. Cloudflare starts first;
+// after HEDGE_DELAY_MS, Groq starts without cancelling Cloudflare. The first
+// *usable text* wins; the other in-flight request is aborted on a best-effort
+// basis. A cancelled inference may still consume quota/billable tokens.
+async function cloudflareHedgeCandidate(cloudflareAIRoot, cloudflareToken, body, originalMessages, signal) {
+  try {
+    for (const attempt of ["initial", "baseline_retry"]) {
+      if (signal.aborted) return { type: "canceled", provider: "cloudflare" };
+      const payload = attempt === "initial" ? body : { ...body, messages: originalMessages };
+      const upstream = await fetch(cloudflareAIRoot + "/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: cloudflareToken,
+          "content-type": "application/json",
+          accept: "application/json",
+        },
+        body: JSON.stringify(payload),
+        signal,
+        redirect: "manual",
+      });
+
+      if (await isCloudflareQuotaExhausted(upstream)) {
+        return {
+          type: "quota", provider: "cloudflare",
+          response: apiError("Cloudflare daily free quota exhausted", 429, "quota_exceeded"),
+        };
+      }
+
+      if (!upstream.ok) {
+        const retired = await cloudflareModelError(upstream, body.model);
+        return {
+          type: "error", provider: "cloudflare",
+          response: retired || apiError(
+            "Cloudflare returned HTTP " + upstream.status,
+            upstream.status, "upstream_error",
+          ),
+        };
+      }
+
+      const parsed = await readChatJson(
+        upstream, attempt === "initial" ? "hedge_initial" : "hedge_baseline_retry", body.model,
+      );
+      if (parsed?.content) {
+        return {
+          type: "success", provider: "cloudflare",
+          response: responseJson(parsed.response, 200, {
+            "x-llm-provider": "cloudflare",
+            "x-llm-model": body.model,
+          }),
+        };
+      }
+      if (attempt === "initial") {
+        console.warn("[cf-chat] hedge_empty_final_retry_same_model");
+      }
+    }
+    return {
+      type: "error", provider: "cloudflare",
+      response: apiError("Cloudflare produced no usable final text", 502, "upstream_error"),
+    };
+  } catch (error) {
+    if (signal.aborted) return { type: "canceled", provider: "cloudflare" };
+    console.warn("[llm-hedge] cloudflare_fetch_failed", JSON.stringify({
+      name: error?.name || "Error",
+    }));
+    return {
+      type: "error", provider: "cloudflare",
+      response: apiError("Cloudflare inference request failed", 502, "upstream_error"),
+    };
+  }
+}
+
+async function groqHedgeCandidate(env, originalMessages, cfBody, settings, controller) {
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, settings.groqTimeoutMs);
+  try {
+    const upstream = await fetch(settings.groqChatUrl, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer " + env.GROQ_API_KEY,
+        "content-type": "application/json",
+        accept: "application/json",
+      },
+      body: JSON.stringify(groqRequestBody(originalMessages, cfBody, false, settings)),
+      signal: controller.signal,
+      redirect: "manual",
+    });
+
+    if (!upstream.ok) {
+      console.warn("[llm-hedge] groq_http_failure", JSON.stringify({ status: upstream.status }));
+      return {
+        type: "error", provider: "groq",
+        response: apiError("Groq returned HTTP " + upstream.status, upstream.status, "upstream_error"),
+      };
+    }
+
+    const parsed = await readChatJson(upstream, "groq_hedge", settings.groqChatModel);
+    if (!parsed?.content) {
+      return {
+        type: "error", provider: "groq",
+        response: apiError("Groq returned no usable text", 502, "upstream_error"),
+      };
+    }
+    return {
+      type: "success", provider: "groq",
+      response: responseJson(parsed.response, 200, {
+        "x-llm-provider": "groq-fallback",
+        "x-llm-model": settings.groqChatModel,
+      }),
+    };
+  } catch (error) {
+    if (timedOut) {
+      console.warn("[llm-hedge] groq_timeout", JSON.stringify({
+        timeout_ms: settings.groqTimeoutMs,
+      }));
+      return {
+        type: "timeout", provider: "groq",
+        response: apiError("Groq parallel inference timed out", 504, "upstream_timeout"),
+      };
+    }
+    if (controller.signal.aborted) return { type: "canceled", provider: "groq" };
+    console.warn("[llm-hedge] groq_fetch_failed", JSON.stringify({
+      name: error?.name || "Error",
+    }));
+    return {
+      type: "error", provider: "groq",
+      response: apiError("Groq parallel inference failed", 502, "upstream_error"),
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function runHedgedChat(request, env, cloudflareToken, cloudflareAIRoot, body, originalMessages, settings) {
+  const start = Date.now();
+  const cloudflareController = new AbortController();
+  const groqController = new AbortController();
+  let delayTimer = null;
+  let deadlineTimer = null;
+  let groqStarted = false;
+
+  // On supported Workers compatibility dates, Request.signal also fires when
+  // OpenWhispr disconnects. Abort both upstreams rather than waste inference.
+  const onDisconnect = () => {
+    cloudflareController.abort();
+    groqController.abort();
+  };
+  request.signal?.addEventListener?.("abort", onDisconnect, { once: true });
+
+  function winner(result) {
+    if (result.provider === "cloudflare") groqController.abort();
+    else cloudflareController.abort();
+    console.info("[llm-hedge] winner", JSON.stringify({
+      provider: result.provider === "groq" ? "groq-fallback" : "cloudflare",
+      model: result.provider === "groq" ? settings.groqChatModel : body.model,
+      hedged: groqStarted,
+      elapsed_ms: Date.now() - start,
+    }));
+    return result.response;
+  }
+
+  try {
+    const cloudflarePromise = cloudflareHedgeCandidate(
+      cloudflareAIRoot, cloudflareToken, body, originalMessages, cloudflareController.signal,
+    );
+
+    const delay = new Promise(resolve => {
+      delayTimer = setTimeout(() => resolve({ type: "hedge_delay" }), settings.hedgeDelayMs);
+    });
+    const first = await Promise.race([cloudflarePromise, delay]);
+    if (first.type !== "hedge_delay") {
+      if (first.type === "success") return winner(first);
+      if (first.type !== "quota") return first.response || apiError("Cloudflare request cancelled", 502);
+      // Preserve the quota-only fallback when the primary responds promptly.
+      console.info("[llm-hedge] cloudflare_quota_fallback");
+      groqStarted = true;
+      const quotaFallback = await groqHedgeCandidate(
+        env, originalMessages, body, settings, groqController,
+      );
+      return quotaFallback.type === "success" ? winner(quotaFallback)
+        : quotaFallback.response || apiError("Groq quota fallback failed", 502, "upstream_error");
+    }
+
+    groqStarted = true;
+    console.info("[llm-hedge] started", JSON.stringify({
+      primary_model: body.model,
+      secondary_model: settings.groqChatModel,
+      delay_ms: settings.hedgeDelayMs,
+    }));
+
+    const groqPromise = groqHedgeCandidate(
+      env, originalMessages, body, settings, groqController,
+    );
+    const remainingMs = Math.max(1, settings.hedgeOverallTimeoutMs - (Date.now() - start));
+    const deadline = new Promise(resolve => {
+      deadlineTimer = setTimeout(() => resolve({ type: "deadline" }), remainingMs);
+    });
+
+    const pending = [
+      { provider: "cloudflare", promise: cloudflarePromise },
+      { provider: "groq", promise: groqPromise },
+    ];
+    const failures = [];
+    while (pending.length) {
+      const result = await Promise.race([...pending.map(item => item.promise), deadline]);
+      if (result.type === "deadline") {
+        cloudflareController.abort();
+        groqController.abort();
+        console.warn("[llm-hedge] overall_timeout", JSON.stringify({
+          max_ms: settings.hedgeOverallTimeoutMs,
+        }));
+        return apiError("Both providers exceeded the dictation request deadline", 504, "upstream_timeout");
+      }
+      const index = pending.findIndex(item => item.provider === result.provider);
+      if (index < 0) continue;
+      pending.splice(index, 1);
+      if (result.type === "success") return winner(result);
+      failures.push(result);
+    }
+
+    // The quota outcome is actionable if Groq also failed, but prefer the
+    // provider's actual error when no usable response was produced.
+    const groqError = failures.find(item => item.provider === "groq" && item.response);
+    const cloudflareError = failures.find(item => item.provider === "cloudflare" && item.response);
+    return groqError?.response || cloudflareError?.response
+      || apiError("Neither Cloudflare nor Groq produced usable text", 502, "upstream_error");
+  } finally {
+    if (delayTimer !== null) clearTimeout(delayTimer);
+    if (deadlineTimer !== null) clearTimeout(deadlineTimer);
+    request.signal?.removeEventListener?.("abort", onDisconnect);
+  }
+}
+
 async function handleChat(request, cloudflareToken, env, cloudflareAIRoot, settings) {
   if (limitByHeader(request, settings.maxChatBytes)) {
     return apiError("Chat request too large", 413);
@@ -606,6 +861,15 @@ async function handleChat(request, cloudflareToken, env, cloudflareAIRoot, setti
   console.info("[llm-route] selected_model", JSON.stringify({
     provider: "cloudflare", model: body.model, stream: wantsStream,
   }));
+
+  if (settings.hedgeOnSlow && !wantsStream) {
+    if (typeof env?.GROQ_API_KEY === "string" && env.GROQ_API_KEY.trim()) {
+      return runHedgedChat(
+        request, env, cloudflareToken, cloudflareAIRoot, body, originalMessages, settings,
+      );
+    }
+    console.warn("[llm-hedge] skipped_missing_groq_secret");
+  }
 
   try {
     const upstream = await fetch(`${cloudflareAIRoot}/v1/chat/completions`, {
@@ -839,7 +1103,9 @@ export default {
         service: "handy-openless-cloudflare-gateway",
         chat_model: settings.chatModel,
         transcription_model: settings.asrModel,
-        version: "3.1.0",
+        version: "3.2.0",
+        hedge_enabled: settings.hedgeOnSlow,
+        hedge_delay_ms: settings.hedgeDelayMs,
       });
     }
 
