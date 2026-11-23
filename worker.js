@@ -65,7 +65,7 @@ async function availableChatModels(settings, cloudflareAIRoot, cloudflareToken) 
 
 const DEFAULTS = Object.freeze({
   chatModel: GEMMA4_MODEL,
-  hedgeDelayMs: 8000,
+  hedgeDelayMs: 15000,
   hedgeOverallTimeoutMs: 27000,
   groqTimeoutMs: 12000,
   groqChatModel: "qwen/qwen3.8-27b",
@@ -1103,7 +1103,7 @@ export default {
         service: "handy-openless-cloudflare-gateway",
         chat_model: settings.chatModel,
         transcription_model: settings.asrModel,
-        version: "3.2.0",
+        version: "3.2.1",
         hedge_enabled: settings.hedgeOnSlow,
         hedge_delay_ms: settings.hedgeDelayMs,
       });

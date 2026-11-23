@@ -175,7 +175,7 @@ test('debug endpoint is absent, model listing and health are intact', async () =
 
   const health = await gateway.fetch(new Request(`${base}/health`), env);
   assert.equal(health.status, 200);
-  assert.equal((await health.json()).version, '3.2.0');
+  assert.equal((await health.json()).version, '3.2.1');
 
   const listing = await gateway.fetch(new Request(`${base}/v1/models`), env);
   assert.deepEqual((await listing.json()).data.map(item => item.id), [model]);
@@ -578,9 +578,11 @@ test('delayed hedge is opt-in, with user-configurable guardrails', async () => {
     ...env, HEDGE_ON_SLOW: 'true', HEDGE_DELAY_MS: '15',
   });
   const health = await response.json();
-  assert.equal(health.version, '3.2.0');
+  assert.equal(health.version, '3.2.1');
   assert.equal(health.hedge_enabled, true);
   assert.equal(health.hedge_delay_ms, 15);
+  const defaults = await gateway.fetch(new Request(base + '/health'), { ...env, HEDGE_ON_SLOW: 'true' });
+  assert.equal((await defaults.json()).hedge_delay_ms, 15000);
 });
 
 test('hedge does not call Groq when Cloudflare succeeds before delay', async () => {

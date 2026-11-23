@@ -58,7 +58,7 @@ All settings below can be added under **Settings → Variables and Secrets** as 
 | `GROQ_CHAT_MODEL` | `qwen/qwen3.8-27b` | Groq text fallback model |
 | `GROQ_CHAT_URL` | `https://api.groq.com/openai/v1/chat/completions` | HTTPS Groq chat-completions endpoint |
 | `HEDGE_ON_SLOW` | `false` | Set to `true` to start Groq if Cloudflare has not produced usable text by the hedge delay; non-streaming chat only |
-| `HEDGE_DELAY_MS` | `8000` | Delay in milliseconds before starting the parallel Groq request |
+| `HEDGE_DELAY_MS` | `15000` | Delay in milliseconds before starting the parallel Groq request |
 | `GROQ_TIMEOUT_MS` | `12000` | Maximum time to wait for a hedge-initiated Groq response |
 | `HEDGE_OVERALL_TIMEOUT_MS` | `27000` | Total time budget for the race, including the delay; must be ≤ 28000ms to stay under OpenWhispr's 30-second deadline |
 | `ASR_MODEL` | `@cf/openai/whisper-large-v3-turbo` | Cloudflare audio transcription model |
@@ -143,7 +143,7 @@ The model, chat and audio paths also accept requests without the `/v1` prefix fo
 
 ### Optional delayed race (slow Cloudflare response)
 
-To enable the behavior for OpenWhispr, add `HEDGE_ON_SLOW=true` under the Worker's Text variables and keep a valid `GROQ_API_KEY` Worker Secret. The default `HEDGE_DELAY_MS=8000` means Cloudflare starts at once; if it has not **finished producing usable text** after eight seconds, the Worker sends the original cleanup messages to Groq **without cancelling Cloudflare**. Whichever provider first returns a valid non-empty final response wins. The losing request is then aborted on a best-effort basis. You may adjust `HEDGE_DELAY_MS` (for example, 10000).
+To enable the behavior for OpenWhispr, add `HEDGE_ON_SLOW=true` under the Worker's Text variables and keep a valid `GROQ_API_KEY` Worker Secret. The default `HEDGE_DELAY_MS=15000` means Cloudflare starts at once; if it has not **finished producing usable text** after 15 seconds, the Worker sends the original cleanup messages to Groq **without cancelling Cloudflare**. Whichever provider first returns a valid non-empty final response wins. The losing request is then aborted on a best-effort basis. You may adjust `HEDGE_DELAY_MS` explicitly to shorten or lengthen the delay, provided it remains below the overall timeout. If an older `HEDGE_DELAY_MS` environment variable is already set, update or remove it to use the new 15-second default.
 
 `GROQ_TIMEOUT_MS=12000` limits the secondary request; if it fails, the Cloudflare request continues. `HEDGE_OVERALL_TIMEOUT_MS=27000` bounds the combined wait to finish before the OpenWhispr 30-second non-streaming timeout. This mode applies **only to non-streaming chat completions**, not speech recognition or SSE streaming. Without the Groq secret it logs `[llm-hedge] skipped_missing_groq_secret` and uses the original Cloudflare path. A prompt quota error still triggers the original Groq fallback immediately, while a model-not-found error returned before the hedge delay still fails clearly rather than silently switching providers.
 
